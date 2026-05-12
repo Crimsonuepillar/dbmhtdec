@@ -3233,45 +3233,59 @@ async def _fetch_public_inventory_asset_ids(
     )
     out: set[str] = set()
     start_assetid: str | None = None
-    for _page in range(10):
-        params: dict[str, str | int] = {"l": "english", "count": 2000}
-        if start_assetid:
-            params["start_assetid"] = start_assetid
-        get_kwargs: dict = dict(
-            url=url,
-            params=params,
-            timeout=aiohttp.ClientTimeout(total=30),
-        )
-        if proxy:
-            get_kwargs["proxy"] = proxy
-        try:
-            async with session.get(**get_kwargs) as resp:
-                if resp.status != 200:
-                    # 400/403/429/5xx — профиль закрыт / лимит / временная ошибка.
-                    return None
-                try:
-                    data = await resp.json(content_type=None)
-                except Exception:  # noqa: BLE001
-                    return None
-        except Exception:  # noqa: BLE001
-            return None
-        if not isinstance(data, dict):
-            return None
-        assets = data.get("assets")
-        # Если профиль закрыт — Steam отвечает 200 + пустой JSON, тут `assets is None`.
-        if assets is None:
-            return None if not out else out  # вернуть то что насобирали
-        for a in assets:
-            aid = a.get("assetid") or a.get("asset_id")
-            if aid:
-                out.add(str(aid))
-        # Steam возвращает `more_items=1` + `last_assetid` если есть ещё.
-        if not data.get("more_items"):
-            break
-        nxt = data.get("last_assetid")
-        if not nxt or str(nxt) == start_assetid:
-            break
-        start_assetid = str(nxt)
+    try:
+        for _page in range(10):
+            params: dict[str, str | int] = {"l": "english", "count": 2000}
+            if start_assetid:
+                params["start_assetid"] = start_assetid
+            # ВАЖНО: raise_for_status=False — без этого aiosteampy-сессия с дефолтным
+            # raise_for_status=True кидает ClientResponseError ВНУТРИ session.get(),
+            # и его трудно поймать снаружи (видимо потому что aiohttp в некоторых
+            # версиях кидает его из _request таски). Лучше явно сказать «не кидай»,
+            # а статус-код прочитаем сами.
+            get_kwargs: dict = dict(
+                url=url,
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=30),
+                raise_for_status=False,
+                allow_redirects=True,
+            )
+            if proxy:
+                get_kwargs["proxy"] = proxy
+            try:
+                async with session.get(**get_kwargs) as resp:
+                    if resp.status != 200:
+                        # 400/403/429/5xx — профиль закрыт / лимит / временная ошибка.
+                        return None
+                    try:
+                        data = await resp.json(content_type=None)
+                    except Exception:  # noqa: BLE001
+                        return None
+            except asyncio.CancelledError:
+                raise
+            except BaseException:  # noqa: BLE001
+                # Любая ошибка сети/прокси/aiohttp — просто отказываемся от diff'а.
+                return None
+            if not isinstance(data, dict):
+                return None
+            assets = data.get("assets")
+            # Профиль закрыт → 200 + пустой JSON; тут `assets is None`.
+            if assets is None:
+                return None if not out else out
+            for a in assets:
+                aid = a.get("assetid") or a.get("asset_id")
+                if aid:
+                    out.add(str(aid))
+            if not data.get("more_items"):
+                break
+            nxt = data.get("last_assetid")
+            if not nxt or str(nxt) == start_assetid:
+                break
+            start_assetid = str(nxt)
+    except asyncio.CancelledError:
+        raise
+    except BaseException:  # noqa: BLE001
+        return None
     return out
 
 
@@ -3770,10 +3784,29 @@ async def _run_sweep(accounts: list[dict], sessions: dict, force_relogin: bool) 
             print(f"{prefix}  логин (proxy {_mask_proxy_for_log(proxy)}) ...", flush=True)
         else:
             print(f"{prefix}  логин ...", flush=True)
+        # Жёсткий per-account timeout — без него медленный/мёртвый прокси может
+        # подвесить ВЕСЬ sweep навечно. На Windows asyncio Ctrl-C не всегда
+        # ловится, поэтому таймаут обязателен. 10 минут на акк — с большим
+        # запасом для нормальной сети.
+        per_acc_timeout_sec = int(os.getenv("SWEEP_ACC_TIMEOUT_SEC", "600"))
         try:
-            res = await _sweep_one_account(
-                account, sessions, force_relogin, fetch_history=True, proxy=proxy,
+            res = await asyncio.wait_for(
+                _sweep_one_account(
+                    account, sessions, force_relogin, fetch_history=True, proxy=proxy,
+                ),
+                timeout=per_acc_timeout_sec,
             )
+        except asyncio.TimeoutError:
+            print(
+                f"{prefix}  [TIMEOUT] акк не уложился в {per_acc_timeout_sec}s "
+                f"(скорее всего тупит {'прокси' if proxy else 'main IP'}). Пропускаю."
+            )
+            res = {
+                "username": username, "label": who,
+                "ok": False, "balance": None, "orders": None,
+                "inventories": {}, "history_added": 0,
+                "errors": [f"TIMEOUT after {per_acc_timeout_sec}s"],
+            }
         except KeyboardInterrupt:
             print("\n[!] Прервано пользователем. Уже собранное в кеше осталось.")
             break
