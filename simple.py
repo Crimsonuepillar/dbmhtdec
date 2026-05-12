@@ -3202,91 +3202,153 @@ _PUBLIC_INVENTORY_APP_CONTEXT: dict[str, tuple[int, int]] = {
 }
 
 
-async def _fetch_public_inventory_asset_ids(
-    session,
+# Имитируем браузерный User-Agent для запросов к public inventory endpoint.
+# Без него Steam часто отвечает 403 на «голый» aiohttp-запрос.
+_PUBLIC_INV_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "en-US,en;q=0.9",
+    "X-Requested-With": "XMLHttpRequest",
+    "Referer": "https://steamcommunity.com/",
+}
+
+
+async def _fetch_public_inventory_asset_ids(  # noqa: PLR0912, C901
+    session,  # больше не используется — оставлен для обратной совместимости
     steam_id_64: int | str,
     ctx_str: str,
     *,
     proxy: str | None = None,
-) -> set[str] | None:
-    """Возвращает set asset_id'ов в публичной выдаче инвентаря пользователя.
+) -> tuple[set[str] | None, str | None]:
+    """Возвращает (set asset_id'ов в публичной выдаче, error_reason | None).
 
     Использует `https://steamcommunity.com/inventory/<id>/<appid>/<ctxid>`
-    (без авторизации, доступен для публичных профилей). Возвращает None если
-    эндпоинт недоступен / профиль private / в ответе нет ассетов / 4xx.
+    через **отдельную чистую aiohttp-сессию без кук** (как в инкогнито).
+    Если использовать `client.session` залогиненого SteamClient'а — Steam часто
+    отвечает 401/403, потому что куки принадлежат другому юзеру.
 
-    Стимовский лимит count=2000 за страницу (всё что выше — 400 Bad Request).
-    Поэтому идём по страницам через `start_assetid` из ответа (`more_items`),
-    но ограничиваем 10 страниц (=20k предметов) — для CS2 этого хватает.
+    Стимовский лимит count=2000 за страницу (выше — 400). Идём страницами
+    через `start_assetid` из `more_items`, max 10 страниц.
 
-    `proxy`: опционально HTTP/SOCKS прокси. Если задан, запрос пойдёт через
-    него (без него — с main IP сессии).
+    Возвращает:
+        (set, None)        — успех
+        (None, "HTTP 401") — профиль приватный или Steam режект
+        (None, "HTTP 429") — rate-limit
+        (None, "HTTP 5xx") — Steam-серверная ошибка
+        (None, "timeout")  — сетевой таймаут
+        (None, "net:XXX")  — другая сетевая ошибка
+        (None, "private")  — 200, но JSON без assets (профиль скрыл инвентарь)
+
+    `proxy`: опционально HTTP/SOCKS прокси.
     """
     import aiohttp
     app_ctx = _PUBLIC_INVENTORY_APP_CONTEXT.get(ctx_str)
     if app_ctx is None:
-        return None
+        return (None, "unsupported-ctx")
     app_id, context_id = app_ctx
     url = (
         f"https://steamcommunity.com/inventory/{steam_id_64}/"
         f"{app_id}/{context_id}"
     )
+
+    # Чистая сессия — без кук залогиненого аккаунта. cookie_jar=DummyCookieJar()
+    # отключает приём set-cookie, чтобы между ретраями не накопить «трекинговые»
+    # куки от Steam.
+    connector_kwargs = {}
+    timeout = aiohttp.ClientTimeout(total=30)
     out: set[str] = set()
     start_assetid: str | None = None
+    last_error_reason: str | None = None
+
     try:
-        for _page in range(10):
-            params: dict[str, str | int] = {"l": "english", "count": 2000}
-            if start_assetid:
-                params["start_assetid"] = start_assetid
-            # ВАЖНО: raise_for_status=False — без этого aiosteampy-сессия с дефолтным
-            # raise_for_status=True кидает ClientResponseError ВНУТРИ session.get(),
-            # и его трудно поймать снаружи (видимо потому что aiohttp в некоторых
-            # версиях кидает его из _request таски). Лучше явно сказать «не кидай»,
-            # а статус-код прочитаем сами.
-            get_kwargs: dict = dict(
-                url=url,
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=30),
-                raise_for_status=False,
-                allow_redirects=True,
-            )
-            if proxy:
-                get_kwargs["proxy"] = proxy
-            try:
-                async with session.get(**get_kwargs) as resp:
-                    if resp.status != 200:
-                        # 400/403/429/5xx — профиль закрыт / лимит / временная ошибка.
-                        return None
+        async with aiohttp.ClientSession(
+            cookie_jar=aiohttp.DummyCookieJar(),
+            headers=_PUBLIC_INV_HEADERS,
+            timeout=timeout,
+            **connector_kwargs,
+        ) as fresh:
+            for _page in range(10):
+                params: dict[str, str | int] = {"l": "english", "count": 2000}
+                if start_assetid:
+                    params["start_assetid"] = start_assetid
+
+                # Ретрай на 429 с backoff'ом (1с → 3с → 7с).
+                backoffs = [0, 1, 3, 7]
+                data = None
+                for attempt, delay in enumerate(backoffs):
+                    if delay:
+                        await asyncio.sleep(delay)
                     try:
-                        data = await resp.json(content_type=None)
-                    except Exception:  # noqa: BLE001
-                        return None
-            except asyncio.CancelledError:
-                raise
-            except BaseException:  # noqa: BLE001
-                # Любая ошибка сети/прокси/aiohttp — просто отказываемся от diff'а.
-                return None
-            if not isinstance(data, dict):
-                return None
-            assets = data.get("assets")
-            # Профиль закрыт → 200 + пустой JSON; тут `assets is None`.
-            if assets is None:
-                return None if not out else out
-            for a in assets:
-                aid = a.get("assetid") or a.get("asset_id")
-                if aid:
-                    out.add(str(aid))
-            if not data.get("more_items"):
-                break
-            nxt = data.get("last_assetid")
-            if not nxt or str(nxt) == start_assetid:
-                break
-            start_assetid = str(nxt)
+                        get_kwargs: dict = dict(
+                            url=url,
+                            params=params,
+                            raise_for_status=False,
+                            allow_redirects=True,
+                        )
+                        if proxy:
+                            get_kwargs["proxy"] = proxy
+                        async with fresh.get(**get_kwargs) as resp:
+                            status = resp.status
+                            if status == 200:
+                                try:
+                                    data = await resp.json(content_type=None)
+                                    break  # success — выйдем из retry-цикла
+                                except Exception:  # noqa: BLE001
+                                    last_error_reason = "parse-error"
+                                    return (None, last_error_reason)
+                            elif status == 429:
+                                last_error_reason = f"HTTP 429"
+                                # Идём на следующий backoff
+                                continue
+                            elif status in (401, 403):
+                                # Профиль приватный / Steam режект — ретрай не поможет
+                                return (None, f"HTTP {status}")
+                            elif status >= 500:
+                                last_error_reason = f"HTTP {status}"
+                                # Steam-серверная — backoff может помочь
+                                continue
+                            else:
+                                return (None, f"HTTP {status}")
+                    except asyncio.CancelledError:
+                        raise
+                    except asyncio.TimeoutError:
+                        last_error_reason = "timeout"
+                        continue
+                    except aiohttp.ClientError as exc:
+                        last_error_reason = f"net:{type(exc).__name__}"
+                        continue
+                    except BaseException as exc:  # noqa: BLE001
+                        last_error_reason = f"err:{type(exc).__name__}"
+                        continue
+                else:
+                    # Все retry-попытки исчерпаны
+                    return (None, last_error_reason or "retries-exhausted")
+
+                if not isinstance(data, dict):
+                    return (None, "not-json")
+                assets = data.get("assets")
+                # Профиль публичный, но инвентарь спрятан → 200, assets=None.
+                if assets is None:
+                    return (out if out else None, "private" if not out else None)
+                for a in assets:
+                    aid = a.get("assetid") or a.get("asset_id")
+                    if aid:
+                        out.add(str(aid))
+                if not data.get("more_items"):
+                    break
+                nxt = data.get("last_assetid")
+                if not nxt or str(nxt) == start_assetid:
+                    break
+                start_assetid = str(nxt)
     except asyncio.CancelledError:
         raise
-    except BaseException:  # noqa: BLE001
-        return None
-    return out
+    except BaseException as exc:  # noqa: BLE001
+        return (None, f"err:{type(exc).__name__}")
+
+    return (out, None)
 
 
 # Список (label_for_user, AppContext, app_context_str_name_for_cache).
@@ -3468,7 +3530,7 @@ async def _sweep_one_account(  # noqa: PLR0912, PLR0915, C901
             try:
                 sid = getattr(client, "steam_id", None)
                 if sid and ctx_str == "CS2":
-                    public_ids = await _fetch_public_inventory_asset_ids(
+                    public_ids, err_reason = await _fetch_public_inventory_asset_ids(
                         client.session, sid, ctx_str, proxy=proxy,
                     )
                     if public_ids is not None:
@@ -3484,9 +3546,9 @@ async def _sweep_one_account(  # noqa: PLR0912, PLR0915, C901
                         )
                         result.setdefault("hidden_from_public", {})[label_inv] = n_hid
                     else:
-                        # Профиль private / эндпоинт недоступен — не падаем.
+                        # Эндпоинт вернул ошибку или 200 без assets — пишем точный код.
                         result["errors"].append(
-                            f"public-inv-{label_inv}: профиль закрыт или 4xx"
+                            f"public-inv-{label_inv}: {err_reason or 'unknown'}"
                         )
             except Exception as exc:  # noqa: BLE001
                 result["errors"].append(
