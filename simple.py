@@ -3778,46 +3778,80 @@ async def _run_sweep(accounts: list[dict], sessions: dict, force_relogin: bool) 
         else:
             who = username
         prefix = f"[{idx}/{len(accounts)}] {who[:28]:<28}"
-        # Берём текущий прокси из ротатора (или None если пул отсутствует/исчерпан).
-        proxy = rotator.current()
-        if proxy:
-            print(f"{prefix}  логин (proxy {_mask_proxy_for_log(proxy)}) ...", flush=True)
-        else:
-            print(f"{prefix}  логин ...", flush=True)
         # Жёсткий per-account timeout — без него медленный/мёртвый прокси может
         # подвесить ВЕСЬ sweep навечно. На Windows asyncio Ctrl-C не всегда
         # ловится, поэтому таймаут обязателен. 10 минут на акк — с большим
         # запасом для нормальной сети.
         per_acc_timeout_sec = int(os.getenv("SWEEP_ACC_TIMEOUT_SEC", "600"))
-        try:
-            res = await asyncio.wait_for(
-                _sweep_one_account(
-                    account, sessions, force_relogin, fetch_history=True, proxy=proxy,
-                ),
-                timeout=per_acc_timeout_sec,
-            )
-        except asyncio.TimeoutError:
-            print(
-                f"{prefix}  [TIMEOUT] акк не уложился в {per_acc_timeout_sec}s "
-                f"(скорее всего тупит {'прокси' if proxy else 'main IP'}). Пропускаю."
-            )
-            res = {
-                "username": username, "label": who,
-                "ok": False, "balance": None, "orders": None,
-                "inventories": {}, "history_added": 0,
-                "errors": [f"TIMEOUT after {per_acc_timeout_sec}s"],
-            }
-        except KeyboardInterrupt:
-            print("\n[!] Прервано пользователем. Уже собранное в кеше осталось.")
+        # На TIMEOUT (только!) ретраим тот же акк с СЛЕДУЮЩИМ прокси из ротатора.
+        # Лимит ретраев: min(размер пула, 3). Если прокси нет — не ретраим вообще.
+        max_proxy_attempts = min(rotator.size, 3) if rotator.size > 0 else 1
+        res = None  # будет точно перезаписан
+        proxy_attempt = 0
+        keyboard_interrupted = False
+        while True:
+            proxy_attempt += 1
+            proxy = rotator.current()
+            attempt_tag = ""
+            if rotator.size > 0 and max_proxy_attempts > 1:
+                attempt_tag = f" (попытка {proxy_attempt}/{max_proxy_attempts})"
+            if proxy:
+                print(
+                    f"{prefix}  логин (proxy {_mask_proxy_for_log(proxy)})"
+                    f"{attempt_tag} ...",
+                    flush=True,
+                )
+            else:
+                print(f"{prefix}  логин{attempt_tag} ...", flush=True)
+            try:
+                res = await asyncio.wait_for(
+                    _sweep_one_account(
+                        account, sessions, force_relogin,
+                        fetch_history=True, proxy=proxy,
+                    ),
+                    timeout=per_acc_timeout_sec,
+                )
+                break  # успех (даже если внутри res.ok=False, но не из-за таймаута)
+            except asyncio.TimeoutError:
+                # На таймаут — пробуем следующий прокси.
+                print(
+                    f"{prefix}  [TIMEOUT] не уложился в {per_acc_timeout_sec}s "
+                    f"({'через прокси ' + _mask_proxy_for_log(proxy) if proxy else 'main IP'})."
+                )
+                if proxy:
+                    rotator.mark_bad()
+                if proxy_attempt >= max_proxy_attempts:
+                    print(
+                        f"{prefix}  [TIMEOUT] исчерпал {max_proxy_attempts} прокси-попыток."
+                        " Пропускаю акк."
+                    )
+                    res = {
+                        "username": username, "label": who,
+                        "ok": False, "balance": None, "orders": None,
+                        "inventories": {}, "history_added": 0,
+                        "errors": [
+                            f"TIMEOUT after {per_acc_timeout_sec}s × "
+                            f"{max_proxy_attempts} попыток"
+                        ],
+                    }
+                    break
+                # Иначе — повторяем цикл, rotator.current() уже укажет на новый.
+                continue
+            except KeyboardInterrupt:
+                print("\n[!] Прервано пользователем. Уже собранное в кеше осталось.")
+                keyboard_interrupted = True
+                break
+            except Exception as exc:  # noqa: BLE001
+                print(f"{prefix}  [FATAL] {type(exc).__name__}: {exc}")
+                res = {
+                    "username": username, "label": who,
+                    "ok": False, "balance": None, "orders": None,
+                    "inventories": {}, "history_added": 0,
+                    "errors": [f"FATAL: {type(exc).__name__}"],
+                }
+                break
+        if keyboard_interrupted:
             break
-        except Exception as exc:  # noqa: BLE001
-            print(f"{prefix}  [FATAL] {type(exc).__name__}: {exc}")
-            res = {
-                "username": username, "label": who,
-                "ok": False, "balance": None, "orders": None,
-                "inventories": {}, "history_added": 0,
-                "errors": [f"FATAL: {type(exc).__name__}"],
-            }
         # who сохраняем в результат, чтобы в финальной сводке тоже была форма «80 (login)».
         res["who"] = who
         results.append(res)
@@ -3846,7 +3880,9 @@ async def _run_sweep(accounts: list[dict], sessions: dict, force_relogin: bool) 
                 f"{prefix}  FAIL  bal={bal_str}  orders={res['orders']}  "
                 f"inv: {inv_summary}  errors: {'; '.join(res['errors'])}"
             )
-        # Failover: если прокси-sweep упал — пометим текущий прокси «плохим».
+        # Failover: если sweep вернул FAIL (но не по таймауту — таймауты уже
+        # отыграли свой ретрай-цикл выше) и есть прокси — метим bad. На OK —
+        # просто переходим к следующему прокси.
         if proxy and not res.get("ok"):
             rotator.mark_bad()
         else:
