@@ -146,34 +146,45 @@ def _to_iso(dt) -> str | None:
     return None
 
 
-_MIGRATIONS = [
+# Миграции: (table, column, ddl_column_def). Накатываем `ALTER TABLE ... ADD COLUMN`
+# только если столбца ещё нет (через PRAGMA table_info). Так мы не зависим от
+# отлова `sqlite3.OperationalError: duplicate column name` — IDE-шный дебаггер
+# всё равно бьёт breakpoint на raise, даже если мы потом исключение глотаем.
+_COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     # Numeric ordering field for the account picker — populated from account.json `label`
     # if it parses as int. NULL → sorted last.
-    "ALTER TABLE accounts ADD COLUMN label_num INTEGER",
+    ("accounts", "label_num", "INTEGER"),
     # asset_id / unowned_id для cross-ref «предмет уже на листинге» с инвентарём.
-    "ALTER TABLE listings_cache ADD COLUMN asset_id TEXT",
-    "ALTER TABLE listings_cache ADD COLUMN unowned_id TEXT",
-    # extra_json со старых БД мог быть удалён прошлым миграционным шагом —
-    # вернём его. Безопасно падает «duplicate column», когда уже есть.
-    "ALTER TABLE inventory_cache ADD COLUMN extra_json TEXT",
+    ("listings_cache", "asset_id", "TEXT"),
+    ("listings_cache", "unowned_id", "TEXT"),
+    # extra_json со старых БД мог быть удалён прошлым миграционным шагом — вернём.
+    ("inventory_cache", "extra_json", "TEXT"),
     # state предмета — нужно для группировки cross-account stats:
-    # "marketable" / "not_marketable" / "trade_protect" / "trade_hold".
-    # NULL = не определено (например, инвентарь записан старой версией).
-    "ALTER TABLE inventory_cache ADD COLUMN state TEXT",
+    # "free" / "on_market" / "trade_protect" / "trade_hold".
+    ("inventory_cache", "state", "TEXT"),
     # tradable_after (ISO) — для trade_hold/trade_protect показать таймер.
-    "ALTER TABLE inventory_cache ADD COLUMN tradable_after TEXT",
+    ("inventory_cache", "tradable_after", "TEXT"),
 ]
+
+
+def _table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    """True если в `table` уже есть столбец `column` (PRAGMA table_info)."""
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    # row format: (cid, name, type, notnull, dflt_value, pk)
+    return any(r[1] == column for r in rows)
 
 
 def open_db() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.executescript(_SCHEMA)
-    for stmt in _MIGRATIONS:
+    for table, column, ddl in _COLUMN_MIGRATIONS:
+        if _table_has_column(conn, table, column):
+            continue
         try:
-            conn.execute(stmt)
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
         except sqlite3.OperationalError:
-            # столбец уже удалён или БД создана с новой схемой — ок
+            # На случай гонки — между PRAGMA и ALTER кто-то уже добавил столбец.
             pass
     conn.commit()
     return conn
@@ -840,6 +851,41 @@ def get_known_event_ids(username: str) -> set[str]:
             (username,),
         ).fetchall()
     return {r[0] for r in rows if r[0]}
+
+
+def iter_all_market_history(limit: int | None = None) -> list[dict]:
+    """Все события `market_history` по всем аккаунтам, по `time_event DESC`.
+
+    Возвращает список dict: {username, event_id, event_type, market_hash_name,
+    time_event, price_cents, currency_code}. `limit` ограничивает выборку
+    (None — без лимита; обычно ставим N=200 чтобы не тащить тысячи событий).
+
+    Используется в задаче 6: общая cross-account история сделок маркета.
+    """
+    sql = (
+        "SELECT username, event_id, event_type, market_hash_name, "
+        "time_event, price_cents, currency_code "
+        "FROM market_history "
+        "ORDER BY time_event DESC, event_id DESC"
+    )
+    params: tuple = ()
+    if limit is not None and limit > 0:
+        sql += " LIMIT ?"
+        params = (int(limit),)
+    with _db() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        out.append({
+            "username": r[0],
+            "event_id": r[1],
+            "event_type": r[2],
+            "market_hash_name": r[3],
+            "time_event": r[4],
+            "price_cents": r[5],
+            "currency_code": r[6],
+        })
+    return out
 
 
 def get_balance_diff_since_yesterday(username: str) -> int | None:

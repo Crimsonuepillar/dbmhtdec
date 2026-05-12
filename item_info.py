@@ -625,6 +625,43 @@ def _parse_listings_render(data: dict) -> list[dict]:
 # api.csfloat.com часто отбивает «голые» запросы (без браузерных заголовков),
 # поэтому добавляем User-Agent + Referer + Origin как реальный браузер.
 _CSFLOAT_BASE_URL = "https://api.csfloat.com/"
+_CSFLOAT_HOST = "api.csfloat.com"
+
+# Кешируем результат DNS-резолва api.csfloat.com на время процесса:
+#   None — ещё не проверяли;
+#   True — резолв успешный, ходим;
+#   False — резолв упал (нет интернета / DNS у провайдера, нужна VPN).
+# После одного fail (None, None) возвращаем мгновенно — не насилуем сеть и
+# не ждём таймаут на каждый из 10/20/50 листингов (см. fix #8 из бэклога).
+_CSFLOAT_DNS_OK: bool | None = None
+
+
+async def _csfloat_dns_check() -> bool:
+    """True если api.csfloat.com резолвится; False если нет.
+
+    Прогоняется один раз за процесс — результат кешируется в `_CSFLOAT_DNS_OK`.
+    """
+    global _CSFLOAT_DNS_OK
+    if _CSFLOAT_DNS_OK is not None:
+        return _CSFLOAT_DNS_OK
+    import asyncio  # локально — не плодим top-level импорты
+    import socket
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.getaddrinfo(_CSFLOAT_HOST, 443, proto=socket.IPPROTO_TCP)
+        _CSFLOAT_DNS_OK = True
+    except Exception as exc:  # noqa: BLE001
+        _CSFLOAT_DNS_OK = False
+        print(
+            f"   [!] api.csfloat.com — DNS-резолв упал: "
+            f"{type(exc).__name__}: {exc}\n"
+            "       Скорее всего, провайдер блокирует csfloat.com (нужна VPN) "
+            "или\n"
+            "       нет интернета. Флоаты в этой сессии резолвиться не будут —\n"
+            "       последующие запросы я не буду отправлять, чтобы не ждать\n"
+            "       таймаут на каждом листинге. Включи VPN и перезапусти скрипт."
+        )
+    return _CSFLOAT_DNS_OK
 _CSFLOAT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -673,6 +710,13 @@ async def _resolve_float_via_csfloat(
     вызывающий (`_show_listings_with_floats` спит 2с между запросами).
     """
     if not inspect_url:
+        return (None, None)
+
+    # 0) DNS pre-flight. Если api.csfloat.com не резолвится — выходим сразу.
+    # Без этой проверки каждый из 10/20/50 листингов будет ждать таймаут
+    # httpx.ConnectError → aiohttp.ClientConnectorDNSError, что подвешивает
+    # UI на минуту-другую. Один раз за процесс пробуем DNS — потом кеш.
+    if not await _csfloat_dns_check():
         return (None, None)
 
     # 1) httpx (предпочтительный путь, как предложено).

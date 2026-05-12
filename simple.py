@@ -373,6 +373,113 @@ async def _with_retry(coro_factory, *, what: str, attempts: int = 3):
     return None  # unreachable
 
 
+async def _place_sell_listing_with_retry(
+    client,
+    item_or_asset_id,
+    app_context,
+    *,
+    price: int,
+    what: str,
+):
+    """place_sell_listing с авто-ретраем 429 (через `_with_retry`) и доп. ретраем
+    при сбое mobile-confirm (Steam: «Failed to perform confirmation action»).
+
+    Поведение при confirm-сбое (задача 1 из бэклога):
+        1) выждать пару секунд,
+        2) найти pending-листинг этого asset_id в `listings_to_confirm`/`active`,
+        3) `cancel_sell_listing` → предмет возвращается в инвентарь,
+        4) `place_sell_listing` повторно (1 раз).
+
+    `app_context` обязателен, если `item_or_asset_id` — это int (asset_id).
+    Для EconItem можно передать None — aiosteampy достанет app_context из объекта.
+    """
+    asset_id = getattr(item_or_asset_id, "asset_id", None) or int(item_or_asset_id)
+
+    def _build_call():
+        if app_context is None:
+            return lambda: client.place_sell_listing(
+                item_or_asset_id, price=price, confirm=True,
+            )
+        return lambda: client.place_sell_listing(
+            item_or_asset_id, app_context, price=price, confirm=True,
+        )
+
+    try:
+        return await _with_retry(_build_call(), what=what)
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc).lower()
+        is_confirm_fail = (
+            "perform confirmation" in msg
+            or "confirmation action" in msg
+        )
+        if not is_confirm_fail:
+            raise
+        print(
+            f"   [!] {what}: подтверждение листинга упало ({exc!r}).\n"
+            "       Пробую найти pending-листинг и пересоздать заново."
+        )
+        await asyncio.sleep(2.5)
+
+        # Find pending listing in to_confirm/active by asset_id.
+        pending_id = None
+        try:
+            active, to_confirm, _bo, _total = await _with_retry(
+                lambda: client.get_my_listings(start=0, count=100),
+                what="get_my_listings (place-retry lookup)",
+            )
+            for lst in list(to_confirm or []) + list(active or []):
+                try:
+                    item = getattr(lst, "item", None)
+                    if item is None:
+                        continue
+                    if str(getattr(item, "asset_id", None)) == str(asset_id):
+                        pending_id = lst.id
+                        break
+                    unowned = getattr(item, "unowned_id", None)
+                    if unowned is not None and str(unowned) == str(asset_id):
+                        pending_id = lst.id
+                        break
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception as e:  # noqa: BLE001
+            print(f"       [!] Не смог получить листинги для поиска pending: {e!r}.")
+            raise exc
+
+        if pending_id is None:
+            print(
+                "       [..] Pending-листинг не найден (Steam, возможно, не успел "
+                "его записать). Просто повторно выставляю."
+            )
+        else:
+            print(f"       [..] Отменяю pending-листинг {pending_id} ...")
+            async def _do_cancel(lid=pending_id):
+                cm = client.cancel_sell_listing(lid)
+                async with cm as resp:
+                    return resp.status
+            try:
+                status = await _with_retry(
+                    _do_cancel, what=f"cancel_sell_listing (retry, lid={pending_id})",
+                )
+                if status is not None and status >= 400:
+                    raise RuntimeError(f"HTTP {status}")
+            except Exception as e:  # noqa: BLE001
+                print(
+                    f"       [!] Не смог отменить pending-листинг {pending_id}: {e!r}.\n"
+                    "       Повторно выставлять не буду — нужно почистить вручную."
+                )
+                raise exc
+            await asyncio.sleep(1.5)
+
+        # One more attempt.
+        try:
+            result = await _with_retry(_build_call(), what=f"{what} (retry)")
+            print(f"   [OK] {what}: перевыставлено успешно.")
+            return result
+        except Exception as exc2:  # noqa: BLE001
+            print(f"       [!] Повторное выставление тоже упало: {exc2!r}")
+            raise
+
+
 # =============================================================================
 # Команды меню
 # =============================================================================
@@ -683,6 +790,36 @@ def _resolve_market_hash_name(item_or_descr) -> str | None:
         or item_or_descr
     )
     return getattr(descr, "market_hash_name", None) or getattr(descr, "name", None)
+
+
+def _make_item_info_callback(client, currency_enum, currency_code: int, item_or_descr):
+    """Возвращает async-callback () -> None: открывает item-info по конкретному
+    предмету. Используется как `i_callback` в `_ask_price_cents` — на вводе `i`
+    в момент ввода цены пользователь видит график/стаканы перед покупкой.
+
+    Если у item нет распознаваемого App или market_hash_name — callback
+    выводит сообщение и не падает.
+    """
+    async def _cb():
+        try:
+            import item_info as _ii
+        except ImportError as exc:
+            print(f"   [BUG] item_info модуль не загружен: {exc}")
+            return
+        name = _resolve_market_hash_name(item_or_descr)
+        if not name:
+            print("   [!] У предмета нет market_hash_name — info недоступно.")
+            return
+        app = _resolve_app_for_item(item_or_descr)
+        if app is None:
+            print("   [!] Не могу определить app (CS2/Steam/Dota2/TF2) у предмета.")
+            return
+        sym = _currency_symbol(currency_enum, currency_code) if currency_code else ""
+        await _ii.show_item_info_menu(
+            client, name, app, currency_enum, currency_code,
+            ask=_ask, currency_sym=sym,
+        )
+    return _cb
 
 
 def _item_info_action_factory(client, currency_enum, currency_code: int, sym: str):
@@ -1607,28 +1744,39 @@ def _print_inventory_item(
             print(f"          🔗 чарм: {c_name}  (pattern={c_pattern})")
 
 
-async def _ask_price_cents(prompt: str) -> int | None:
+async def _ask_price_cents(prompt: str, *, i_callback=None) -> int | None:
     """Спросить цену типа `1.99`/`1,99` — вернёт центы (int) или None.
 
     None возвращается на пустой ввод и на «q» / «b» (back) — это
     стандартные команды отмены/возврата.
+
+    Если задан `i_callback` (async no-arg вызываемый объект) — на вводе `i`
+    он вызывается (обычно открывает item-info / график цен), потом снова
+    спрашивается цена. Без callback `i` обрабатывается как невалидный ввод.
     """
-    raw = (await _ask(prompt)).strip().replace(",", ".")
-    if not raw or raw.lower() in ("q", "b"):
-        return None
-    try:
-        amount = float(raw)
-    except ValueError:
-        print(f"   «{raw}» не похоже на число.")
-        return None
-    if amount <= 0:
-        print("   Цена должна быть > 0.")
-        return None
-    cents = int(round(amount * 100))
-    if cents <= 0:
-        print("   Цена слишком мала.")
-        return None
-    return cents
+    while True:
+        raw = (await _ask(prompt)).strip().replace(",", ".")
+        if not raw or raw.lower() in ("q", "b"):
+            return None
+        if raw.lower() == "i" and i_callback is not None:
+            try:
+                await i_callback()
+            except Exception as exc:  # noqa: BLE001
+                print(f"   [!] item-info упал: {exc!r}")
+            continue
+        try:
+            amount = float(raw)
+        except ValueError:
+            print(f"   «{raw}» не похоже на число.")
+            return None
+        if amount <= 0:
+            print("   Цена должна быть > 0.")
+            return None
+        cents = int(round(amount * 100))
+        if cents <= 0:
+            print("   Цена слишком мала.")
+            return None
+        return cents
 
 
 async def _list_item_action(
@@ -1708,10 +1856,12 @@ async def _list_item_action(
                     return
 
         print(f"   Выставить «{name}» (asset_id={item.asset_id}) на продажу.")
+        info_cb = _make_item_info_callback(client, currency_enum, currency_code, item)
         cents = await _ask_price_cents(
             "   Цена для покупателя в "
             + ("долларах" if currency_code == 1 else "валюте кошелька")
-            + " (1.99, q/b/Enter — назад): "
+            + " (1.99, i=инфо/график, q/b/Enter — назад): ",
+            i_callback=info_cb,
         )
         if cents is None:
             print("   Отменено.")
@@ -1729,8 +1879,8 @@ async def _list_item_action(
             return
         print("   [..] Отправляю запрос (может потребоваться mobile-confirm) ...")
         try:
-            result = await _with_retry(
-                lambda: client.place_sell_listing(item, price=cents, confirm=True),
+            result = await _place_sell_listing_with_retry(
+                client, item, app_context=None, price=cents,
                 what="place_sell_listing",
             )
         except Exception as exc:  # noqa: BLE001
@@ -2019,27 +2169,41 @@ async def _bulk_list_group(
         print("   Нечего выставлять.")
         return
 
-    # Цена.
-    cents = await _ask_price_cents(
-        "   Цена для покупателя в "
-        + ("долларах" if currency_code == 1 else "валюте кошелька")
-        + " (например 1.99, q/b/Enter — назад): "
+    # 1) Сколько штук выставить (как в _bulk_sell_cross_account).
+    info_cb = _make_item_info_callback(
+        client, currency_enum, currency_code, marketable[0],
     )
-    if cents is None:
-        print("   Отменено, возвращаемся в инвентарь.")
+    total_marketable = len(marketable)
+    while True:
+        raw_n = (await _ask(
+            f"   Сколько штук выставить? (1..{total_marketable}, all=все, "
+            f"i=инфо по предмету, q/b=отмена): "
+        )).strip().lower()
+        if raw_n in ("q", "b", ""):
+            print("   Отменено, возвращаемся в инвентарь.")
+            return
+        if raw_n == "i":
+            try:
+                await info_cb()
+            except Exception as exc:  # noqa: BLE001
+                print(f"   [!] item-info упал: {exc!r}")
+            continue
+        break
+    if raw_n == "all":
+        n_target = total_marketable
+    else:
+        try:
+            n_target = int(raw_n)
+        except ValueError:
+            print(f"   «{raw_n}» — не число, отмена.")
+            return
+    if n_target <= 0 or n_target > total_marketable:
+        print(f"   Допустимо 1..{total_marketable}, отмена.")
         return
 
-    try:
-        _s_fee, _p_fee, to_receive = buyer_pays_to_receive(cents)
-    except Exception:  # noqa: BLE001
-        to_receive = None
-    gross_str = _format_price(cents, currency_enum, currency_code)
-    receive_str = _format_price(to_receive, currency_enum, currency_code) if to_receive else "?"
-    print(f"   Покупатель платит: {gross_str}.   Ты получишь на кошелёк: {receive_str}.")
-
-    # Фильтр по float — НИЖНЯЯ граница.
-    # Идея: у редких/дорогих скинов float маленький (Factory New). Чтобы случайно
-    # не выставить ценный экземпляр по средней цене, можно ввести min_float —
+    # 2) Фильтр по float — НИЖНЯЯ граница (только CS2).
+    # У редких/дорогих скинов float маленький (Factory New). Чтобы случайно
+    # не выставить ценный экземпляр по средней цене, вводим min_float —
     # всё что НИЖЕ этого порога будет пропущено.
     min_float: float | None = None
     if with_cs2_extras:
@@ -2065,13 +2229,35 @@ async def _bulk_list_group(
             except ValueError:
                 print(f"   «{raw}» не похоже на float — игнорирую.")
 
-    # Прогоняем каждый предмет через фильтры.
+    # 3) Цена. С i=info колбэком.
+    cents = await _ask_price_cents(
+        "   Цена для покупателя в "
+        + ("долларах" if currency_code == 1 else "валюте кошелька")
+        + " (например 1.99, i=инфо/график, q/b/Enter — назад): ",
+        i_callback=info_cb,
+    )
+    if cents is None:
+        print("   Отменено, возвращаемся в инвентарь.")
+        return
+
+    try:
+        _s_fee, _p_fee, to_receive = buyer_pays_to_receive(cents)
+    except Exception:  # noqa: BLE001
+        to_receive = None
+    gross_str = _format_price(cents, currency_enum, currency_code)
+    receive_str = _format_price(to_receive, currency_enum, currency_code) if to_receive else "?"
+    print(f"   Покупатель платит: {gross_str}.   Ты получишь на кошелёк: {receive_str}.")
+
+    # Прогоняем каждый предмет через фильтры. Останавливаемся как только
+    # набрали n_target кандидатов (пользователь хочет выставить N штук, не все).
     to_list: list = []
     skipped_by_float = 0
     skipped_by_pattern = 0
     skipped_uncertain_by_user = 0
 
     for it in marketable:
+        if len(to_list) >= n_target:
+            break
         wear, seed = (None, None)
         if with_cs2_extras:
             wear, seed = _cs2_extract_wear_seed(it)
@@ -2104,7 +2290,8 @@ async def _bulk_list_group(
 
         to_list.append(it)
 
-    print(f"\n   Итого к выставлению: {len(to_list)} из {len(marketable)} marketable.")
+    print(f"\n   Итого к выставлению: {len(to_list)} из {n_target} запрошенных "
+          f"({total_marketable} marketable доступно).")
     if skipped_by_float:
         print(f"   Пропущено по float < {min_float}: {skipped_by_float}.")
     if skipped_by_pattern:
@@ -2124,8 +2311,8 @@ async def _bulk_list_group(
     fail = 0
     for i, item in enumerate(to_list, 1):
         try:
-            result = await _with_retry(
-                lambda it=item: client.place_sell_listing(it, price=cents, confirm=True),
+            result = await _place_sell_listing_with_retry(
+                client, item, app_context=None, price=cents,
                 what=f"place_sell_listing #{i}",
             )
             ok += 1
@@ -2424,10 +2611,13 @@ async def _show_inventory_generic(
     extra = {"e": _expand_action}
     print("   `e <номер>` — развернуть группу в плоский список (и там можно `s <N>`).")
     if sellable:
-        extra["b"] = _bulk_list_action
+        # `s <N>` — выставление группы (раньше было `b`, переименовано задачей 10).
+        # Сценарий теперь как у cross-account bulk-list: спрашиваем сколько штук,
+        # min_float, цену (с `i=инфо` callback) — а не «всю группу одной кнопкой».
+        extra["s"] = _bulk_list_action
         print(
-            "   `b <номер>` — выставить ВСЮ группу одной ценой "
-            "(с фильтром по float и блэклистом редких паттернов)."
+            "   `s <номер>` — выставить часть группы по одной цене "
+            "(спрошу сколько штук, min float, цену; i=инфо/график)."
         )
     # Сгруппированный вид показываем без пагинации — групп обычно мало,
     # листать неудобно (#6 в фидбеке).
@@ -2687,6 +2877,48 @@ def _ensure_aiosteampy_patches() -> bool:
             pass
 
     ItemDescription._set_d_id = _set_d_id_safe
+
+    # Патч бага aiosteampy: `_parse_buy_orders` падает с KeyError('description'),
+    # если в ответе get_my_listings присутствует buy-ордер от не-CS2 игры
+    # (например, Dota 2) — у такого ордера в JSON нет вложенного 'description',
+    # а исходный код жёстко обращается к `o_data["description"]["instanceid"]`.
+    # Оборачиваем по элементам: ломаные пропускаем, остальное возвращаем.
+    try:
+        from aiosteampy.mixins.market import MarketMixin
+        from aiosteampy.models import BuyOrder
+        from aiosteampy.utils import create_ident_code
+
+        def _parse_buy_orders_safe(cls, orders, item_descrs_map):  # noqa: ANN001
+            out = []
+            skipped = 0
+            for o_data in orders:
+                try:
+                    descr = o_data["description"]
+                    ident = create_ident_code(
+                        descr["instanceid"], descr["classid"], descr["appid"],
+                    )
+                    out.append(
+                        BuyOrder(
+                            id=int(o_data["buy_orderid"]),
+                            price=int(o_data["price"]),
+                            item_description=item_descrs_map[ident],
+                            quantity=int(o_data["quantity"]),
+                            quantity_remaining=int(o_data["quantity_remaining"]),
+                        )
+                    )
+                except (KeyError, TypeError, ValueError):
+                    # Чаще всего: ордер от другой игры (Dota 2) без вложенного
+                    # description'а — нам он всё равно не нужен в меню CS2.
+                    skipped += 1
+                    continue
+            if skipped:
+                print(f"   [patch] _parse_buy_orders: пропущено {skipped} ордеров без description.")
+            return out
+
+        MarketMixin._parse_buy_orders = classmethod(_parse_buy_orders_safe)
+    except Exception as exc:  # noqa: BLE001
+        print(f"   [!] не смог запатчить _parse_buy_orders: {exc!r}")
+
     _patch_aiosteampy_once_done = True
     return True
 
@@ -3302,7 +3534,14 @@ def _load_proxy_pool() -> list[str]:
 
 
 async def _run_sweep(accounts: list[dict], sessions: dict, force_relogin: bool) -> None:
-    """Запускает sweep по всем аккаунтам последовательно с прогрессом."""
+    """Запускает sweep по всем аккаунтам последовательно с прогрессом.
+
+    Аккаунты сортируются тем же ключом, что и в `_pick_account`: сначала по
+    числовому label по возрастанию (1, 2, 3, ..., 21, 22, ...), потом всё
+    остальное по username. Раньше порядок шёл по `sub.name` из `iterdir`,
+    т.е. лексикографически — поэтому 21 стоял раньше 5.
+    """
+    accounts = _sort_accounts(accounts)
     print("\n" + "=" * 120)
     print(f"   SWEEP — {len(accounts)} аккаунт(а/ов). Последовательно. Прерывание — Ctrl-C.")
     print("=" * 120)
@@ -3485,6 +3724,438 @@ def _build_label_lookup(accounts: list[dict]) -> dict[str, str]:
     return out
 
 
+async def _show_unbanned_today(
+    *,
+    accounts: list[dict],
+    sessions: dict,
+    force_relogin: bool,
+    label_lookup: dict[str, str],
+) -> None:
+    """Показывает предметы, разбанившиеся за последние 24ч (cross-account).
+
+    Берёт `inventory_cache`, отбирает по `tradable_after ∈ [now-24h, now]`,
+    группирует по имени. На `s <N>` запускает cross-account bulk-list для ВСЕХ
+    свободных экземпляров этого имени (как и просит юзер — задача 7).
+    """
+    import cache as _cache
+    from datetime import datetime, timezone, timedelta
+
+    all_rows = _cache.iter_inventory()
+    now = datetime.now(timezone.utc)
+    day_ago = now - timedelta(hours=24)
+    recently: list[dict] = []
+    for r in all_rows:
+        ta_raw = r.get("tradable_after")
+        if not ta_raw:
+            continue
+        try:
+            ta = datetime.fromisoformat(str(ta_raw))
+            if ta.tzinfo is None:
+                ta = ta.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            continue
+        if day_ago <= ta <= now:
+            recently.append(r)
+
+    if not recently:
+        print(
+            "\n   (за последние 24ч ничего не разбанилось — пусто. "
+            "Сделай sweep если ещё не делал в этой сессии.)"
+        )
+        await _press_enter_to_continue()
+        return
+
+    from collections import defaultdict
+    by_name: dict[str, list[dict]] = defaultdict(list)
+    name_to_appctx: dict[str, str] = {}
+    for r in recently:
+        nm = r.get("market_hash_name") or "?"
+        by_name[nm].append(r)
+        name_to_appctx[nm] = r.get("app_context") or ""
+
+    # (name, qty_recent, accounts_count_recent)
+    grouped: list[tuple[str, int, int]] = []
+    for nm, rs in by_name.items():
+        grouped.append((nm, len(rs), len({rr["username"] for rr in rs})))
+    grouped.sort(key=lambda x: -x[1])
+
+    accounts_lookup = {a["username"]: a for a in accounts}
+
+    def _render(items_slice, start_idx):
+        print("\n" + "─" * 92)
+        print(
+            f"   Разбанилось за 24ч: {len(grouped)} уник. имён, "
+            f"{len(recently)} предметов (cross-account)"
+        )
+        print("─" * 92)
+        print(f"   {'#':<4} {'Имя':<50}  {'qty(24h)':<10}  {'аккаунтов':<10}")
+        print("─" * 92)
+        for i, (nm, qty, accs_n) in enumerate(items_slice, start_idx):
+            short = nm if len(nm) <= 50 else nm[:47] + "..."
+            print(f"   {i:<4} {short:<50}  {qty:<10}  {accs_n:<10}")
+        print("─" * 92)
+        print(
+            "   s <N> — bulk-list по имени (выставить N экз. с разных аккаунтов; "
+            "берёт ВСЕ state=free, не только разбанившиеся)"
+        )
+
+    async def _bulk_action(group_row, idx_1based, _all_groups):
+        name = group_row[0]
+        ctx_str = name_to_appctx.get(name) or ""
+        # Все state=free для этого имени — НЕ ограничиваемся «разбанившимися»,
+        # как и просит задача 7 («все конкретно, не только разбанившиеся»).
+        candidates = [
+            r for r in _cache.iter_inventory(app_context=ctx_str or None)
+            if r.get("market_hash_name") == name
+            and (r.get("state") or "") == "free"
+        ]
+        if not candidates:
+            print(
+                f"   Для «{name}» нет свободных экземпляров (state=free) — "
+                "выставлять нечего."
+            )
+            return
+        await _bulk_sell_cross_account(
+            name=name,
+            candidates=candidates,
+            accounts_lookup=accounts_lookup,
+            sessions=sessions,
+            force_relogin=force_relogin,
+            app_context_str=ctx_str,
+            label_lookup=label_lookup,
+        )
+
+    page_size = max(len(grouped), 1)
+    await _paginate(
+        grouped, page_size, _render,
+        extra_commands={"s": _bulk_action},
+    )
+
+
+# =============================================================================
+# Задача 2: авто-принятие пустых трейдов в фоне.
+#
+# Идея: пользователь покупает кейсы на 5-6 аккаунтах ежедневно (через Trade Up
+# Bot или подобный сервис). Бот шлёт трейд-офферы, где `items_to_give=[]`
+# (юзер ничего не отдаёт, только получает). Если их не принять — товар
+# отменяется. Скрипт в фоне поллит `get_trade_offers` каждые 5 мин и
+# подтверждает пустые офферы автоматически.
+#
+# Безопасность: принимаем ТОЛЬКО офферы где `items_to_give` пуст. Если бот
+# вдруг положит что-то «себе на отдачу» — пропустим, рукой принимай.
+# =============================================================================
+_AUTOTRADE_TASK = None  # type: ignore[var-annotated]
+_AUTOTRADE_STATE: dict = {
+    "usernames": [],
+    "interval_sec": 300,
+    "accepted": 0,
+    "errors": 0,
+    "last_poll": None,
+    "started_at": None,
+}
+
+
+async def _autotrade_loop(
+    usernames: list[str],
+    sessions: dict,
+    accounts_lookup: dict[str, dict],
+    force_relogin: bool,
+    label_lookup: dict[str, str],
+    interval_sec: int,
+) -> None:
+    """Фоновый цикл: каждый `interval_sec` чекает офферы, принимает пустые.
+
+    Шумит в stdout, но это «фоновое» в смысле asyncio — UI-поток продолжает
+    обслуживать выбор аккаунта, и нам не приходится плодить отдельный поток.
+    """
+    print(
+        f"[autotrade] start: {len(usernames)} акк(ов), poll every {interval_sec}s. "
+        "Принимаем только офферы с items_to_give=[]."
+    )
+    _AUTOTRADE_STATE["started_at"] = datetime.now(timezone.utc).isoformat()
+    try:
+        while True:
+            for username in list(usernames):
+                try:
+                    if username not in sessions:
+                        acc = accounts_lookup.get(username)
+                        if acc is None:
+                            continue
+                        connected = await _connect_account(acc, force_relogin)
+                        if connected is None:
+                            print(
+                                f"[autotrade] {username}: login failed, пропускаю."
+                            )
+                            continue
+                        sessions[username] = connected
+                    client, _cur, _cf = sessions[username]
+                    who = _acc_display(username, label_lookup)
+                    try:
+                        sent, recv, _total = await client.get_trade_offers(
+                            active_only=True, sent=False, received=True,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        _AUTOTRADE_STATE["errors"] += 1
+                        print(f"[autotrade] {who}: get_trade_offers упал: {exc!r}")
+                        continue
+                    for offer in (recv or []):
+                        try:
+                            if getattr(offer, "is_our_offer", False):
+                                continue
+                            if offer.items_to_give:
+                                # юзер что-то отдаёт — НЕ автопринимаем
+                                continue
+                            n_recv = len(offer.items_to_receive)
+                            try:
+                                await client.accept_trade_offer(offer, confirm=True)
+                                _AUTOTRADE_STATE["accepted"] += 1
+                                print(
+                                    f"[autotrade] {who}: принят оффер {offer.id} "
+                                    f"(получаем {n_recv} предмет(ов), отдаём 0)."
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                _AUTOTRADE_STATE["errors"] += 1
+                                print(
+                                    f"[autotrade] {who}: accept_trade_offer "
+                                    f"{offer.id} упал: {exc!r}"
+                                )
+                        except Exception as exc:  # noqa: BLE001
+                            _AUTOTRADE_STATE["errors"] += 1
+                            print(
+                                f"[autotrade] {who}: обработка оффера упала: {exc!r}"
+                            )
+                except Exception as exc:  # noqa: BLE001
+                    _AUTOTRADE_STATE["errors"] += 1
+                    print(f"[autotrade] {username}: poll упал: {exc!r}")
+            _AUTOTRADE_STATE["last_poll"] = datetime.now(timezone.utc).isoformat()
+            try:
+                await asyncio.sleep(interval_sec)
+            except asyncio.CancelledError:
+                raise
+    except asyncio.CancelledError:
+        print("[autotrade] остановлен пользователем.")
+        raise
+
+
+async def _start_autotrade(
+    accounts: list[dict],
+    sessions: dict,
+    force_relogin: bool,
+) -> None:
+    """Интерактивное меню задачи 2: старт / стоп / статус авто-принятия."""
+    global _AUTOTRADE_TASK
+    accounts_lookup = {a["username"]: a for a in accounts}
+    label_lookup = _build_label_lookup(accounts)
+
+    default_interval = int(os.getenv("AUTO_TRADE_POLL_SEC", "300") or 300)
+    if default_interval < 30:
+        default_interval = 30  # защита от спам-полла
+
+    while True:
+        running = _AUTOTRADE_TASK is not None and not _AUTOTRADE_TASK.done()
+        print("\n" + "=" * 78)
+        print("   АВТО-ПРИНЯТИЕ ПУСТЫХ ТРЕЙДОВ (фон)")
+        print("=" * 78)
+        print(
+            f"   Статус: {'РАБОТАЕТ' if running else 'остановлено'}.  "
+            f"Принято: {_AUTOTRADE_STATE['accepted']}, ошибок: "
+            f"{_AUTOTRADE_STATE['errors']}."
+        )
+        if running:
+            who = ", ".join(
+                _acc_display(u, label_lookup)
+                for u in _AUTOTRADE_STATE["usernames"]
+            )
+            print(f"   Аккаунты: {who}")
+            print(
+                f"   Интервал: {_AUTOTRADE_STATE['interval_sec']}с, "
+                f"last_poll={_AUTOTRADE_STATE.get('last_poll') or '—'}"
+            )
+            print("   1) Остановить")
+            print("   2) Статус (refresh)")
+            print("   0) Назад (фон продолжает работать)")
+        else:
+            print("   1) Запустить (выбрать аккаунты)")
+            print("   0) Назад")
+        raw = (await _ask("\n   Выбор: ")).strip().lower()
+        if raw in ("", "0"):
+            return
+        if running:
+            if raw == "1":
+                _AUTOTRADE_TASK.cancel()
+                try:
+                    await _AUTOTRADE_TASK
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:  # noqa: BLE001
+                    print(f"   [!] задача упала при остановке: {exc!r}")
+                _AUTOTRADE_TASK = None
+                print("   Авто-принятие остановлено.")
+                continue
+            if raw == "2":
+                continue
+            print("   Не понял.")
+            continue
+        if raw != "1":
+            print("   Не понял.")
+            continue
+        # Запуск: выбор аккаунтов.
+        sorted_accs = _sort_accounts(accounts)
+        print("\n   Аккаунты:")
+        for i, a in enumerate(sorted_accs, 1):
+            who = _acc_display(a["username"], label_lookup)
+            print(f"     {i:>3}. {who}")
+        sel_raw = (await _ask(
+            "\n   Введи номера через запятую (`1,3,5`) либо `all` для всех "
+            "(q=отмена): "
+        )).strip().lower()
+        if sel_raw in ("", "q"):
+            print("   Отменено.")
+            continue
+        if sel_raw == "all":
+            usernames = [a["username"] for a in sorted_accs]
+        else:
+            usernames = []
+            ok = True
+            for part in sel_raw.replace(";", ",").split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    idx = int(part)
+                except ValueError:
+                    print(f"   «{part}» — не номер. Отмена.")
+                    ok = False
+                    break
+                if not (1 <= idx <= len(sorted_accs)):
+                    print(f"   {idx} вне диапазона 1..{len(sorted_accs)}. Отмена.")
+                    ok = False
+                    break
+                usernames.append(sorted_accs[idx - 1]["username"])
+            if not ok or not usernames:
+                continue
+            # дедуп с сохранением порядка
+            seen = set()
+            usernames = [u for u in usernames if not (u in seen or seen.add(u))]
+        # Интервал.
+        iv_raw = (await _ask(
+            f"   Интервал между чеками в сек "
+            f"(>=30, Enter={default_interval}): "
+        )).strip()
+        interval_sec = default_interval
+        if iv_raw:
+            try:
+                interval_sec = max(30, int(iv_raw))
+            except ValueError:
+                print(f"   «{iv_raw}» — не число, оставляю {default_interval}с.")
+                interval_sec = default_interval
+        # Reset stats и поехали.
+        _AUTOTRADE_STATE["usernames"] = list(usernames)
+        _AUTOTRADE_STATE["interval_sec"] = interval_sec
+        _AUTOTRADE_STATE["accepted"] = 0
+        _AUTOTRADE_STATE["errors"] = 0
+        _AUTOTRADE_STATE["last_poll"] = None
+        _AUTOTRADE_TASK = asyncio.create_task(
+            _autotrade_loop(
+                usernames=usernames,
+                sessions=sessions,
+                accounts_lookup=accounts_lookup,
+                force_relogin=force_relogin,
+                label_lookup=label_lookup,
+                interval_sec=interval_sec,
+            )
+        )
+        print(
+            f"   Запущено в фоне: {len(usernames)} акк(ов), интервал {interval_sec}с.\n"
+            "   Меню остаётся активным; чтобы остановить — снова t) → 1) Остановить."
+        )
+
+
+async def _show_global_market_history(
+    accounts: list[dict] | None = None,
+    *,
+    limit: int = 200,
+) -> None:
+    """Cross-account история сделок на маркете (последние N событий).
+
+    Берёт записи из `market_history` (накапливается во время sweep'а), сортирует
+    по времени убыв., печатает: [время] АККАУНТ — ТИП — name — цена currency.
+    """
+    import cache as _cache
+    label_lookup = _build_label_lookup(accounts or [])
+    from aiosteampy.constants import Currency as _Cur
+
+    while True:
+        events = _cache.iter_all_market_history(limit=limit)
+        print("\n" + "=" * 100)
+        print(f"   ИСТОРИЯ МАРКЕТА — последние {len(events)} событий (cross-account)")
+        print("=" * 100)
+        if not events:
+            print("   (пусто — запусти sweep, во время него догрузится дельта истории)")
+            print("\n   Enter — назад.")
+            await _ask("")
+            return
+
+        # Группируем счётчики «куплено / продано / ещё что-то» — для шапки.
+        from collections import Counter
+        types = Counter(e.get("event_type") or "?" for e in events)
+        accs = Counter(e.get("username") for e in events)
+        print(
+            "   Типы: "
+            + ", ".join(f"{t}={n}" for t, n in types.most_common())
+        )
+        print(
+            f"   С {len(accs)} аккаунтов (топ-5: "
+            + ", ".join(
+                f"{_acc_display(u, label_lookup)}={n}"
+                for u, n in accs.most_common(5)
+            )
+            + ")"
+        )
+        print("-" * 100)
+        print(
+            f"   {'когда':<20} {'аккаунт':<18} {'тип':<14} "
+            f"{'цена':<14}  название"
+        )
+        print("-" * 100)
+        for ev in events:
+            when = ev.get("time_event") or "—"
+            who = _acc_display(ev.get("username") or "?", label_lookup)[:18]
+            tp = (ev.get("event_type") or "?")[:14]
+            name = ev.get("market_hash_name") or "?"
+            pc = ev.get("price_cents")
+            cc = ev.get("currency_code")
+            if pc is None or not cc:
+                price = "—"
+            else:
+                try:
+                    price = _format_price(int(pc), _Cur, int(cc))
+                except Exception:  # noqa: BLE001
+                    price = f"{int(pc) / 100:.2f}"
+            short_name = name if len(name) <= 50 else name[:47] + "..."
+            print(f"   {when:<20} {who:<18} {tp:<14} {price:<14}  {short_name}")
+        print("-" * 100)
+        print(
+            f"   `m <N>` — показать больше (например `m 500`; сейчас limit={limit}).\n"
+            "   Enter / q — назад."
+        )
+        raw = (await _ask("\n   Выбор: ")).strip().lower()
+        if not raw or raw in ("q", "0"):
+            return
+        if raw.startswith("m"):
+            tail = raw[1:].strip()
+            try:
+                limit = int(tail) if tail else limit * 2
+            except ValueError:
+                print("   Не число.")
+                continue
+            if limit <= 0:
+                limit = 200
+                print("   Лимит должен быть > 0, ставлю 200.")
+            continue
+        print("   Не понял команду.")
+
+
 async def _show_global_stats(
     accounts: list[dict] | None = None,
     sessions: dict | None = None,
@@ -3508,10 +4179,19 @@ async def _show_global_stats(
             counts[label] = sum(1 for r in _cache.iter_inventory(app_context=ctx_str))
         for i, (label, ctx_str) in enumerate(_GAME_GROUPS, 1):
             print(f"   {i}) {label:<14}— {counts[label]} предметов (в кеше)")
+        print("   u) Tradable с сегодня (cross-account, разбанились за 24ч)")
         print("   0) Назад")
         choice = (await _ask("\nВыбор: ")).strip()
         if choice == "0" or choice == "":
             return
+        if choice.lower() == "u":
+            await _show_unbanned_today(
+                accounts=accounts or [],
+                sessions=sessions or {},
+                force_relogin=force_relogin,
+                label_lookup=label_lookup,
+            )
+            continue
         if choice not in {"1", "2", "3", "4"}:
             print("Не понял.")
             continue
@@ -3931,9 +4611,74 @@ async def _show_grouped_items(
     if has_on_market:
         extra["c"] = _bulk_cancel_action
 
+    # Task 3: позволяем менять порядок сортировки прямо в этой пагинации.
+    # Команды без аргументов уходят в `bulk_commands` (точное совпадение строки).
+    #
+    # Сортировка работает над `grouped` in-place — `_paginate` каждой итерацией
+    # пересекает items[start:end], так что новый порядок виден сразу.
+    max_aid_by_name: dict[str, int] = {}
+    for r in rows:
+        nm = r.get("market_hash_name") or ""
+        aid = r.get("asset_id")
+        if aid is None:
+            continue
+        try:
+            aid_int = int(aid)
+        except (TypeError, ValueError):
+            continue
+        if aid_int > max_aid_by_name.get(nm, -1):
+            max_aid_by_name[nm] = aid_int
+
+    max_price_by_name: dict[str, int] = {}
+    if has_on_market:
+        for r in rows:
+            if (r.get("state") or "") != "on_market":
+                continue
+            info = listing_lookup.get((r["username"], str(r.get("asset_id"))))
+            if not info or info.get("price_cents") is None:
+                continue
+            nm = r.get("market_hash_name") or ""
+            try:
+                pc = int(info["price_cents"])
+            except (TypeError, ValueError):
+                continue
+            if pc > max_price_by_name.get(nm, -1):
+                max_price_by_name[nm] = pc
+
+    def _resort_in_place(items, mode: str) -> None:
+        if mode == "qty":
+            items.sort(key=lambda g: -g[1])
+        elif mode == "name":
+            items.sort(key=lambda g: g[0].lower())
+        elif mode == "new":
+            items.sort(key=lambda g: -max_aid_by_name.get(g[0], -1))
+        elif mode == "price":
+            items.sort(key=lambda g: -max_price_by_name.get(g[0], -1))
+
+    def _make_sort_action(mode: str):
+        async def _act(items_list):
+            _resort_in_place(items_list, mode)
+            print(f"   [sort] переотсортировано по: {mode}.")
+        return _act
+
+    bulk = {
+        "sort qty":   _make_sort_action("qty"),
+        "sort new":   _make_sort_action("new"),
+        "sort name":  _make_sort_action("name"),
+    }
+    if has_on_market:
+        bulk["sort price"] = _make_sort_action("price")
+
+    print(
+        "   Сортировка: `sort qty` (по умолчанию) / `sort new` (по новизне asset_id) "
+        + ("/ `sort price` (макс. цена) " if has_on_market else "")
+        + "/ `sort name`."
+    )
+
     await _paginate(
         grouped, page_size, _render,
         extra_commands=extra,
+        bulk_commands=bulk,
     )
 
 
@@ -4256,10 +5001,8 @@ async def _bulk_sell_cross_account(  # noqa: PLR0912, PLR0915, C901
             for i, item_row in enumerate(items_for_user, 1):
                 asset_id = int(item_row["asset_id"])
                 try:
-                    listing_id = await _with_retry(
-                        lambda aid=asset_id, pc=price_cents: client.place_sell_listing(
-                            aid, target_app_context, price=pc, confirm=True
-                        ),
+                    listing_id = await _place_sell_listing_with_retry(
+                        client, asset_id, target_app_context, price=price_cents,
                         what=f"place_sell_listing #{i} (asset={asset_id}, user={username})",
                     )
                     ok += 1
@@ -4475,6 +5218,8 @@ async def _pick_account(
     *,
     sweep_callback=None,
     stats_callback=None,
+    history_callback=None,
+    autotrade_callback=None,
 ) -> dict | None:
     """Меню выбора аккаунта.
 
@@ -4482,8 +5227,11 @@ async def _pick_account(
     их label как номер (так удобнее с 100 аккаунтами: вводишь номер из тетрадки).
     Иначе — обычная порядковая нумерация 1..N.
 
-    sweep_callback / stats_callback — async-функции без аргументов, которые
-    запускаются по `r` / `g` соответственно (фаза 3).
+    Callback'и (фаза 3 + задачи 6/2):
+      sweep_callback   — `r` — refresh всех (sweep);
+      stats_callback   — `g` — глобальная статистика по инвентарям;
+      history_callback — `h` — общая история сделок маркета (cross-account);
+      autotrade_callback — `t` — авто-принятие пустых трейдов (фон).
     """
     if len(accounts) == 1:
         return accounts[0]
@@ -4507,6 +5255,10 @@ async def _pick_account(
             print("  r) Refresh всех (sweep: balance + orders + инвентари + дельта истории)")
         if stats_callback is not None:
             print("  g) Глобальная статистика по инвентарям (cross-account)")
+        if history_callback is not None:
+            print("  h) История маркета — все аккаунты (cross-account)")
+        if autotrade_callback is not None:
+            print("  t) Авто-принятие пустых трейдов в фоне")
         print("  0) Выход")
         raw = (await _ask("\nВыбор: ")).strip()
         if raw == "0":
@@ -4526,6 +5278,20 @@ async def _pick_account(
                 await stats_callback()
             except Exception as exc:  # noqa: BLE001
                 print(f"[ERROR] stats упало: {exc!r}")
+                traceback.print_exc()
+            continue
+        if raw.lower() == "h" and history_callback is not None:
+            try:
+                await history_callback()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[ERROR] history упало: {exc!r}")
+                traceback.print_exc()
+            continue
+        if raw.lower() == "t" and autotrade_callback is not None:
+            try:
+                await autotrade_callback()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[ERROR] autotrade упало: {exc!r}")
                 traceback.print_exc()
             continue
         try:
@@ -4573,6 +5339,16 @@ async def _run() -> int:
     sessions: dict[str, tuple] = {}  # username → (client, currency_code, cookies_file)
 
     async def _close_all_sessions() -> None:
+        # Сначала останавливаем фоновую автоторговлю (задача 2), чтобы она
+        # не пыталась дёргать сессии после их закрытия.
+        global _AUTOTRADE_TASK
+        if _AUTOTRADE_TASK is not None and not _AUTOTRADE_TASK.done():
+            _AUTOTRADE_TASK.cancel()
+            try:
+                await _AUTOTRADE_TASK
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            _AUTOTRADE_TASK = None
         for _, (cl, _cc, cf) in list(sessions.items()):
             try:
                 cl.session.cookie_jar.save(cf)
@@ -4590,6 +5366,10 @@ async def _run() -> int:
                 accounts,
                 sweep_callback=lambda: _run_sweep(accounts, sessions, force_relogin),
                 stats_callback=lambda: _show_global_stats(
+                    accounts, sessions, force_relogin
+                ),
+                history_callback=lambda: _show_global_market_history(accounts),
+                autotrade_callback=lambda: _start_autotrade(
                     accounts, sessions, force_relogin
                 ),
             )
