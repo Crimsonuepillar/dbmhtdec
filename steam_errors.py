@@ -39,6 +39,7 @@ CAT_PRICE_TOO_HIGH = "price_too_high"
 CAT_SESSION_EXPIRED = "session_expired"  # cookies протухли
 CAT_NOT_LOGGED_IN = "not_logged_in"  # вообще не залогинились
 CAT_NETWORK = "network"  # connection / DNS / timeout
+CAT_TRANSIENT_LISTING = "transient_listing"  # Steam-эпизод: "There was a problem listing your item"
 CAT_UNKNOWN = "unknown"
 
 
@@ -190,6 +191,14 @@ _NOT_LOGGED_IN_RE = re.compile(
 # «trade-protected» / «trade protection»
 _TRADE_PROTECT_RE = re.compile(r"trade[-\s]?protect", re.IGNORECASE)
 
+# «There was a problem listing your item. Refresh the page and try again.»
+# Steam отдаёт это на временный сбой backend'а — листинг почти всегда проходит
+# с ретрая через 2-3 секунды.
+_TRANSIENT_LISTING_RE = re.compile(
+    r"(?:problem\s+listing\s+your\s+item|refresh\s+the\s+page\s+and\s+try\s+again)",
+    re.IGNORECASE,
+)
+
 
 # =============================================================================
 # Главная функция: classify_steam_error
@@ -309,6 +318,17 @@ def classify_steam_error(exc: BaseException) -> SteamError:  # noqa: C901, PLR09
             category=CAT_ITEM_UNAVAILABLE,
             short="Предмет под Trade Protection — продать через маркет нельзя.",
             details={},
+            raw=exc,
+        )
+
+    # 4.5) Временный сбой Steam ("There was a problem listing your item. Refresh
+    #      the page and try again.") — ретраить с задержкой, скорее всего пройдёт.
+    if _TRANSIENT_LISTING_RE.search(text):
+        return SteamError(
+            category=CAT_TRANSIENT_LISTING,
+            short="Steam: \"There was a problem listing your item\" (временно). Можно повторить.",
+            details={},
+            retryable=True,
             raw=exc,
         )
 

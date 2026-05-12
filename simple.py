@@ -404,80 +404,110 @@ async def _place_sell_listing_with_retry(
             item_or_asset_id, app_context, price=price, confirm=True,
         )
 
-    try:
-        return await _with_retry(_build_call(), what=what)
-    except Exception as exc:  # noqa: BLE001
-        msg = str(exc).lower()
-        is_confirm_fail = (
-            "perform confirmation" in msg
-            or "confirmation action" in msg
-        )
-        if not is_confirm_fail:
-            raise
-        print(
-            f"   [!] {what}: подтверждение листинга упало ({exc!r}).\n"
-            "       Пробую найти pending-листинг и пересоздать заново."
-        )
-        await asyncio.sleep(2.5)
-
-        # Find pending listing in to_confirm/active by asset_id.
-        pending_id = None
+    # Ретраи на эпизодический «There was a problem listing your item. Refresh
+    # the page and try again.» — Steam-сбой backend'а; через 3-6с проходит.
+    # До 3 transient-попыток. Если всё ещё ошибка — пробрасываем (или уходим
+    # в confirm-recovery если это другая ошибка).
+    transient_delays = [3, 6, 10]
+    transient_attempt = 0
+    final_exc: Exception | None = None
+    while True:
         try:
-            active, to_confirm, _bo, _total = await _with_retry(
-                lambda: client.get_my_listings(start=0, count=100),
-                what="get_my_listings (place-retry lookup)",
+            return await _with_retry(_build_call(), what=what)
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc).lower()
+            is_transient_listing = (
+                "problem listing your item" in msg
+                or "refresh the page and try again" in msg
             )
-            for lst in list(to_confirm or []) + list(active or []):
-                try:
-                    item = getattr(lst, "item", None)
-                    if item is None:
-                        continue
-                    if str(getattr(item, "asset_id", None)) == str(asset_id):
-                        pending_id = lst.id
-                        break
-                    unowned = getattr(item, "unowned_id", None)
-                    if unowned is not None and str(unowned) == str(asset_id):
-                        pending_id = lst.id
-                        break
-                except Exception:  # noqa: BLE001
-                    pass
-        except Exception as e:  # noqa: BLE001
-            print(f"       [!] Не смог получить листинги для поиска pending: {e!r}.")
-            raise exc
-
-        if pending_id is None:
-            print(
-                "       [..] Pending-листинг не найден (Steam, возможно, не успел "
-                "его записать). Просто повторно выставляю."
-            )
-        else:
-            print(f"       [..] Отменяю pending-листинг {pending_id} ...")
-            async def _do_cancel(lid=pending_id):
-                cm = client.cancel_sell_listing(lid)
-                async with cm as resp:
-                    return resp.status
-            try:
-                status = await _with_retry(
-                    _do_cancel, what=f"cancel_sell_listing (retry, lid={pending_id})",
-                )
-                if status is not None and status >= 400:
-                    raise RuntimeError(f"HTTP {status}")
-            except Exception as e:  # noqa: BLE001
+            if is_transient_listing and transient_attempt < len(transient_delays):
+                wait_s = transient_delays[transient_attempt]
                 print(
-                    f"       [!] Не смог отменить pending-листинг {pending_id}: {e!r}.\n"
-                    "       Повторно выставлять не буду — нужно почистить вручную."
+                    f"   [!] {what}: Steam ответил «There was a problem listing your "
+                    f"item». Жду {wait_s}с и повторяю "
+                    f"({transient_attempt + 1}/{len(transient_delays)}) ..."
                 )
-                raise exc
-            await asyncio.sleep(1.5)
+                transient_attempt += 1
+                await asyncio.sleep(wait_s)
+                continue
+            final_exc = exc
+            break
 
-        # One more attempt.
+    # Сюда попадаем когда транзиент исчерпан, ИЛИ ошибка не transient.
+    exc = final_exc
+    assert exc is not None  # фактически недостижимо
+    msg = str(exc).lower()
+    is_confirm_fail = (
+        "perform confirmation" in msg
+        or "confirmation action" in msg
+    )
+    if not is_confirm_fail:
+        raise exc
+    # Дальше — confirm-recovery: листинг "застрял" между Steam и mobile-confirm.
+    print(
+        f"   [!] {what}: подтверждение листинга упало ({exc!r}).\n"
+        "       Пробую найти pending-листинг и пересоздать заново."
+    )
+    await asyncio.sleep(2.5)
+
+    # Find pending listing in to_confirm/active by asset_id.
+    pending_id = None
+    try:
+        active, to_confirm, _bo, _total = await _with_retry(
+            lambda: client.get_my_listings(start=0, count=100),
+            what="get_my_listings (place-retry lookup)",
+        )
+        for lst in list(to_confirm or []) + list(active or []):
+            try:
+                item = getattr(lst, "item", None)
+                if item is None:
+                    continue
+                if str(getattr(item, "asset_id", None)) == str(asset_id):
+                    pending_id = lst.id
+                    break
+                unowned = getattr(item, "unowned_id", None)
+                if unowned is not None and str(unowned) == str(asset_id):
+                    pending_id = lst.id
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception as e:  # noqa: BLE001
+        print(f"       [!] Не смог получить листинги для поиска pending: {e!r}.")
+        raise exc
+
+    if pending_id is None:
+        print(
+            "       [..] Pending-листинг не найден (Steam, возможно, не успел "
+            "его записать). Просто повторно выставляю."
+        )
+    else:
+        print(f"       [..] Отменяю pending-листинг {pending_id} ...")
+        async def _do_cancel(lid=pending_id):
+            cm = client.cancel_sell_listing(lid)
+            async with cm as resp:
+                return resp.status
         try:
-            result = await _with_retry(_build_call(), what=f"{what} (retry)")
-            print(f"   [OK] {what}: перевыставлено успешно.")
-            return result
-        except Exception as exc2:  # noqa: BLE001
-            print(f"       [!] Повторное выставление тоже упало: {exc2!r}")
-            raise
+            status = await _with_retry(
+                _do_cancel, what=f"cancel_sell_listing (retry, lid={pending_id})",
+            )
+            if status is not None and status >= 400:
+                raise RuntimeError(f"HTTP {status}")
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"       [!] Не смог отменить pending-листинг {pending_id}: {e!r}.\n"
+                "       Повторно выставлять не буду — нужно почистить вручную."
+            )
+            raise exc
+        await asyncio.sleep(1.5)
+
+    # One more attempt.
+    try:
+        result = await _with_retry(_build_call(), what=f"{what} (retry)")
+        print(f"   [OK] {what}: перевыставлено успешно.")
+        return result
+    except Exception as exc2:  # noqa: BLE001
+        print(f"       [!] Повторное выставление тоже упало: {exc2!r}")
+        raise
 
 
 # =============================================================================
