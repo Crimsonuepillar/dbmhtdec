@@ -697,7 +697,9 @@ def _parse_csfloat_payload(data: Any) -> tuple[float | None, int | None]:
 
 
 async def _resolve_float_via_csfloat(
-    session: aiohttp.ClientSession, inspect_url: str
+    session: aiohttp.ClientSession, inspect_url: str,
+    *,
+    proxy: str | None = None,
 ) -> tuple[float | None, int | None]:
     """Запрашивает api.csfloat.com и возвращает (float, seed).
 
@@ -727,12 +729,26 @@ async def _resolve_float_via_csfloat(
 
     if httpx is not None:
         try:
-            async with httpx.AsyncClient(
+            httpx_kwargs: dict = dict(
                 base_url=_CSFLOAT_BASE_URL,
                 headers=_CSFLOAT_HEADERS,
                 timeout=15.0,
-            ) as client:
-                resp = await client.get("/", params={"url": inspect_url})
+            )
+            if proxy:
+                # httpx >=0.28 принимает `proxy="http://..."`; старые версии — `proxies=`.
+                try:
+                    async with httpx.AsyncClient(
+                        proxy=proxy, **httpx_kwargs
+                    ) as client:
+                        resp = await client.get("/", params={"url": inspect_url})
+                except TypeError:
+                    async with httpx.AsyncClient(
+                        proxies=proxy, **httpx_kwargs
+                    ) as client:
+                        resp = await client.get("/", params={"url": inspect_url})
+            else:
+                async with httpx.AsyncClient(**httpx_kwargs) as client:
+                    resp = await client.get("/", params={"url": inspect_url})
             if resp.status_code == 200:
                 try:
                     return _parse_csfloat_payload(resp.json())
@@ -749,12 +765,17 @@ async def _resolve_float_via_csfloat(
             pass
 
     # 2) Fallback: aiohttp с теми же заголовками.
+    aiohttp_kwargs: dict = dict(
+        params={"url": inspect_url},
+        headers=_CSFLOAT_HEADERS,
+        timeout=aiohttp.ClientTimeout(total=15),
+    )
+    if proxy:
+        aiohttp_kwargs["proxy"] = proxy
     try:
         async with session.get(
             _CSFLOAT_BASE_URL,
-            params={"url": inspect_url},
-            headers=_CSFLOAT_HEADERS,
-            timeout=aiohttp.ClientTimeout(total=15),
+            **aiohttp_kwargs,
         ) as resp:
             if resp.status != 200:
                 return (None, None)
@@ -1081,27 +1102,54 @@ async def _show_listings_with_floats(  # noqa: PLR0912, PLR0915, C901
             start = new_start
         elif cmd in ("resolve", "r"):
             n = len(page_listings)
+            import asyncio as _asyncio
+            # Опционально — прокси-пул из simple.py (round-robin + failover).
+            # Импортируем лениво чтобы не создавать circular import.
+            proxy_rot = None
+            try:
+                import simple as _simple  # type: ignore[import-not-found]
+                pool = _simple._load_proxy_pool()
+                if pool:
+                    use_p = (await ask(
+                        f"  Использовать прокси-пул ({len(pool)} шт.) для запросов "
+                        "csfloat? (y/N): "
+                    )).strip().lower()
+                    if use_p in ("y", "yes", "д", "да"):
+                        proxy_rot = _simple._ProxyRotator(pool)
+                        print(
+                            f"  [..] csfloat: round-robin через {len(pool)} прокси "
+                            "(rotate at каждом запросе, failover при ошибке)."
+                        )
+            except Exception:  # noqa: BLE001
+                proxy_rot = None
             print(f"  [..] Резолвлю флоаты {n} листингов через api.csfloat.com ...")
             print("       (rate-limit ~30 req/min, пауза 2с между; может уйти 1-3 мин)")
-            import asyncio as _asyncio
             ok_count = 0
             for i, lst in enumerate(page_listings, 1):
                 if not lst["inspect_url"]:
                     page_floats[lst["listing_id"]] = (None, None)
                     continue
+                current_proxy = proxy_rot.current() if proxy_rot else None
                 fl, sd = await _resolve_float_via_csfloat(
-                    client.session, lst["inspect_url"]
+                    client.session, lst["inspect_url"], proxy=current_proxy,
                 )
                 page_floats[lst["listing_id"]] = (fl, sd)
                 if fl is not None:
                     ok_count += 1
+                    if proxy_rot:
+                        proxy_rot.advance()
+                else:
+                    # Не вышло — отметим прокси как bad (если есть).
+                    if proxy_rot:
+                        proxy_rot.mark_bad()
                 if i % 10 == 0 or i == n:
                     print(f"       {i}/{n} ...", flush=True)
                 await _asyncio.sleep(2.0)
             print(f"  [OK] Резолвлено {ok_count} из {n} (остальные — None).")
             if ok_count == 0:
                 print("       [!] Не удалось получить ни одного флоата. "
-                      "Скорее всего csfloat.com недоступен / rate-limit'ит.")
+                      "Скорее всего csfloat.com недоступен / rate-limit'ит / "
+                      "прокси-пул умер.")
         elif cmd.startswith("flt"):
             # «flt 0.2» — фильтр float<0.2; «flt off» — сбросить.
             arg = cmd[3:].strip()

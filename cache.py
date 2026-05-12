@@ -164,6 +164,14 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("inventory_cache", "state", "TEXT"),
     # tradable_after (ISO) — для trade_hold/trade_protect показать таймер.
     ("inventory_cache", "tradable_after", "TEXT"),
+    # steam_id_64 — нужен чтобы фетчить публичный инвентарь акка для diff'a
+    # (предмет в нашей выдаче — но не в публичной = «недавно разлочен»).
+    ("accounts", "steam_id_64", "TEXT"),
+    # hidden_from_public — bool-флаг (0/1). 1 = предмет в нашем приватном инвентаре,
+    # но НЕ виден в публичной выдаче (display cooldown ~3 дня после разлока).
+    ("inventory_cache", "hidden_from_public", "INTEGER"),
+    # last_public_check_at — ISO время последнего сравнения с публичным инвентарём.
+    ("inventory_cache", "last_public_check_at", "TEXT"),
 ]
 
 
@@ -216,25 +224,95 @@ def _mark_refresh(conn: sqlite3.Connection, username: str, resource: str, *, ext
     )
 
 
-def record_account(username: str, label: str | None = None) -> None:
+def record_account(
+    username: str,
+    label: str | None = None,
+    *,
+    steam_id_64: str | int | None = None,
+) -> None:
     label_num = None
     if label is not None:
         try:
             label_num = int(str(label).strip())
         except (TypeError, ValueError):
             label_num = None
+    sid_str: str | None = None
+    if steam_id_64 is not None:
+        try:
+            sid_str = str(int(steam_id_64))
+        except (TypeError, ValueError):
+            sid_str = None
     with _db() as conn:
         conn.execute(
             """
-            INSERT INTO accounts (username, label, label_num, last_seen_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO accounts (username, label, label_num, steam_id_64, last_seen_at)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(username) DO UPDATE SET
                 label = COALESCE(excluded.label, accounts.label),
                 label_num = COALESCE(excluded.label_num, accounts.label_num),
+                steam_id_64 = COALESCE(excluded.steam_id_64, accounts.steam_id_64),
                 last_seen_at = excluded.last_seen_at
             """,
-            (username, label, label_num, _now_iso()),
+            (username, label, label_num, sid_str, _now_iso()),
         )
+
+
+def get_account_steam_id(username: str) -> str | None:
+    """Возвращает закешированный steam_id_64 для username (или None)."""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT steam_id_64 FROM accounts WHERE username=?",
+            (username,),
+        ).fetchone()
+    return (row[0] if row and row[0] else None)
+
+
+def update_hidden_from_public(
+    username: str,
+    app_context: str,
+    hidden_asset_ids: Iterable[str],
+    *,
+    visible_asset_ids: Iterable[str] | None = None,
+) -> tuple[int, int]:
+    """Обновляет колонку `hidden_from_public` для всех строк аккаунта+контекста.
+
+    `hidden_asset_ids` — asset_id, которых нет в публичной выдаче, но есть в нашей
+    (предметы в display cooldown). Эти ставим в 1.
+
+    `visible_asset_ids` — те, что видны публично; ставим в 0. Если None — НЕ
+    обнуляем остальные строки (на случай частичного обновления).
+
+    `last_public_check_at` проставляется в now для всех затронутых строк.
+
+    Возвращает (n_hidden, n_visible) — сколько строк помечено.
+    """
+    now = _now_iso()
+    hidden_set = {str(x) for x in hidden_asset_ids if x is not None}
+    visible_set = (
+        {str(x) for x in visible_asset_ids if x is not None}
+        if visible_asset_ids is not None else None
+    )
+    with _db() as conn:
+        n_hidden = 0
+        for aid in hidden_set:
+            cur = conn.execute(
+                "UPDATE inventory_cache "
+                "SET hidden_from_public=1, last_public_check_at=? "
+                "WHERE username=? AND app_context=? AND asset_id=?",
+                (now, username, app_context, aid),
+            )
+            n_hidden += cur.rowcount
+        n_visible = 0
+        if visible_set is not None:
+            for aid in visible_set:
+                cur = conn.execute(
+                    "UPDATE inventory_cache "
+                    "SET hidden_from_public=0, last_public_check_at=? "
+                    "WHERE username=? AND app_context=? AND asset_id=?",
+                    (now, username, app_context, aid),
+                )
+                n_visible += cur.rowcount
+    return (n_hidden, n_visible)
 
 
 def record_balance(
@@ -955,7 +1033,8 @@ def iter_inventory(
     sql = (
         "SELECT username, app_context, asset_id, market_hash_name, amount, "
         "paint_seed, paint_wear, extra_json, state, tradable_after, "
-        "last_updated_at FROM inventory_cache"
+        "last_updated_at, hidden_from_public, last_public_check_at "
+        "FROM inventory_cache"
     )
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -974,6 +1053,8 @@ def iter_inventory(
             "state": r[8],
             "tradable_after": r[9],
             "last_updated_at": r[10],
+            "hidden_from_public": bool(r[11]) if r[11] is not None else None,
+            "last_public_check_at": r[12],
         }
         for r in rows
     ]

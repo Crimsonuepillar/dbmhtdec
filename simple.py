@@ -3047,10 +3047,14 @@ async def _connect_account(account: dict, force_relogin: bool, *, proxy: str | N
         print(f"[!] Не смог сразу определить валюту кошелька: {exc!r} (продолжаем).")
 
     # Регистрируем в SQLite-кеше, чтобы аккаунт виден был в меню «Сводка».
+    # steam_id_64 нужен чтобы фетчить публичный инвентарь (см. _show_recently_unlocked).
     try:
         import cache
 
-        cache.record_account(username, account.get("label"))
+        sid = getattr(client, "steam_id", None)
+        cache.record_account(
+            username, account.get("label"), steam_id_64=sid,
+        )
     except Exception:  # noqa: BLE001
         pass
 
@@ -3184,6 +3188,105 @@ async def _show_cache_summary() -> None:
 # `_SECTION_ORDER = ("free", "on_market", "trade_hold", "trade_protect")`.
 # В кеш пишем именно эти значения через state_extractor → `_inventory_state`,
 # который сам учитывает listed_asset_ids + protected_asset_ids.
+
+
+# (AppContext.name → (app_id, context_id)) для публичного эндпоинта инвентаря.
+# Используется в `_fetch_public_inventory_asset_ids` (см. задачу про «недавно
+# разлоченные»: предмет в нашем приватном инвентаре, но не в публичной выдаче
+# = display cooldown ~3 дня после разлока).
+_PUBLIC_INVENTORY_APP_CONTEXT: dict[str, tuple[int, int]] = {
+    "CS2":             (730, 2),
+    "DOTA2":           (570, 2),
+    "STEAM_COMMUNITY": (753, 6),
+    "TF2":             (440, 2),
+}
+
+
+async def _fetch_public_inventory_asset_ids(
+    session,
+    steam_id_64: int | str,
+    ctx_str: str,
+    *,
+    proxy: str | None = None,
+) -> set[str] | None:
+    """Возвращает set asset_id'ов в публичной выдаче инвентаря пользователя.
+
+    Использует `https://steamcommunity.com/inventory/<id>/<appid>/<ctxid>`
+    (без авторизации, доступен для публичных профилей). Возвращает None если
+    эндпоинт недоступен / профиль private / в ответе нет ассетов / 4xx.
+
+    Стимовский лимит count=2000 за страницу (всё что выше — 400 Bad Request).
+    Поэтому идём по страницам через `start_assetid` из ответа (`more_items`),
+    но ограничиваем 10 страниц (=20k предметов) — для CS2 этого хватает.
+
+    `proxy`: опционально HTTP/SOCKS прокси. Если задан, запрос пойдёт через
+    него (без него — с main IP сессии).
+    """
+    import aiohttp
+    app_ctx = _PUBLIC_INVENTORY_APP_CONTEXT.get(ctx_str)
+    if app_ctx is None:
+        return None
+    app_id, context_id = app_ctx
+    url = (
+        f"https://steamcommunity.com/inventory/{steam_id_64}/"
+        f"{app_id}/{context_id}"
+    )
+    out: set[str] = set()
+    start_assetid: str | None = None
+    try:
+        for _page in range(10):
+            params: dict[str, str | int] = {"l": "english", "count": 2000}
+            if start_assetid:
+                params["start_assetid"] = start_assetid
+            # ВАЖНО: raise_for_status=False — без этого aiosteampy-сессия с дефолтным
+            # raise_for_status=True кидает ClientResponseError ВНУТРИ session.get(),
+            # и его трудно поймать снаружи (видимо потому что aiohttp в некоторых
+            # версиях кидает его из _request таски). Лучше явно сказать «не кидай»,
+            # а статус-код прочитаем сами.
+            get_kwargs: dict = dict(
+                url=url,
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=30),
+                raise_for_status=False,
+                allow_redirects=True,
+            )
+            if proxy:
+                get_kwargs["proxy"] = proxy
+            try:
+                async with session.get(**get_kwargs) as resp:
+                    if resp.status != 200:
+                        # 400/403/429/5xx — профиль закрыт / лимит / временная ошибка.
+                        return None
+                    try:
+                        data = await resp.json(content_type=None)
+                    except Exception:  # noqa: BLE001
+                        return None
+            except asyncio.CancelledError:
+                raise
+            except BaseException:  # noqa: BLE001
+                # Любая ошибка сети/прокси/aiohttp — просто отказываемся от diff'а.
+                return None
+            if not isinstance(data, dict):
+                return None
+            assets = data.get("assets")
+            # Профиль закрыт → 200 + пустой JSON; тут `assets is None`.
+            if assets is None:
+                return None if not out else out
+            for a in assets:
+                aid = a.get("assetid") or a.get("asset_id")
+                if aid:
+                    out.add(str(aid))
+            if not data.get("more_items"):
+                break
+            nxt = data.get("last_assetid")
+            if not nxt or str(nxt) == start_assetid:
+                break
+            start_assetid = str(nxt)
+    except asyncio.CancelledError:
+        raise
+    except BaseException:  # noqa: BLE001
+        return None
+    return out
 
 
 # Список (label_for_user, AppContext, app_context_str_name_for_cache).
@@ -3358,6 +3461,37 @@ async def _sweep_one_account(  # noqa: PLR0912, PLR0915, C901
                 partial=False,
             )
             result["inventories"][label_inv] = len(items)
+            # Параллельно дёргаем публичный инвентарь, чтобы посчитать diff:
+            # asset_id, которых в публичной выдаче нет, но в приватной есть
+            # = display cooldown (~3 дня после разлока, см. задачу 7-2).
+            # Делаем ТОЛЬКО для CS2 — один доп. запрос на акк за весь sweep.
+            try:
+                sid = getattr(client, "steam_id", None)
+                if sid and ctx_str == "CS2":
+                    public_ids = await _fetch_public_inventory_asset_ids(
+                        client.session, sid, ctx_str, proxy=proxy,
+                    )
+                    if public_ids is not None:
+                        priv_ids = {
+                            str(it.asset_id) for it in items
+                            if str(it.asset_id) not in protected_asset_ids
+                        }
+                        hidden = priv_ids - public_ids
+                        visible = priv_ids & public_ids
+                        n_hid, _n_vis = _cache.update_hidden_from_public(
+                            username, ctx_str, hidden,
+                            visible_asset_ids=visible,
+                        )
+                        result.setdefault("hidden_from_public", {})[label_inv] = n_hid
+                    else:
+                        # Профиль private / эндпоинт недоступен — не падаем.
+                        result["errors"].append(
+                            f"public-inv-{label_inv}: профиль закрыт или 4xx"
+                        )
+            except Exception as exc:  # noqa: BLE001
+                result["errors"].append(
+                    f"public-inv-{label_inv}: {type(exc).__name__}"
+                )
         except Exception as exc:  # noqa: BLE001
             result["errors"].append(f"inv-{label_inv}: {type(exc).__name__}")
 
@@ -3533,6 +3667,78 @@ def _load_proxy_pool() -> list[str]:
     return []
 
 
+class _ProxyRotator:
+    """Round-robin прокси с failover'ом.
+
+    Используется одинаково в sweep / csfloat / сборе листингов:
+        rot = _ProxyRotator(pool)
+        for ... in N:
+            for _ in range(max_tries):
+                p = rot.current()
+                ok = await do_thing(proxy=p)
+                if ok: break
+                rot.mark_bad()
+            else:
+                # все прокси не отвечают — выходим
+                break
+            rot.advance()
+
+    Прокси, помеченный как `bad`, временно пропускается. Если все плохие — счётчик
+    сбрасывается (вдруг сеть восстановилась), но больше одного полного круга
+    не делаем.
+    """
+
+    def __init__(self, pool: list[str]) -> None:
+        self._pool = list(pool)
+        self._idx = 0
+        self._bad: set[int] = set()
+
+    @property
+    def size(self) -> int:
+        return len(self._pool)
+
+    def current(self) -> str | None:
+        if not self._pool:
+            return None
+        # ищем первый не-bad начиная с _idx
+        for off in range(len(self._pool)):
+            i = (self._idx + off) % len(self._pool)
+            if i not in self._bad:
+                self._idx = i
+                return self._pool[i]
+        # все bad — сбрасываем чёрный список и повторяем
+        self._bad.clear()
+        return self._pool[self._idx] if self._pool else None
+
+    def mark_bad(self) -> None:
+        if self._pool:
+            self._bad.add(self._idx)
+            self._idx = (self._idx + 1) % len(self._pool)
+
+    def advance(self) -> None:
+        """Просто перейти к следующему (без bad-mark)."""
+        if self._pool:
+            self._idx = (self._idx + 1) % len(self._pool)
+
+
+async def _ask_use_proxy(operation_label: str) -> list[str]:
+    """Если `proxies.txt` загрузился — спрашивает «использовать ли прокси».
+
+    Возвращает list прокси (или [] если пул пуст / отказ). Печатает сводку.
+    """
+    pool = _load_proxy_pool()
+    if not pool:
+        return []
+    ans = (await _ask(
+        f"   Использовать прокси-пул ({len(pool)} шт.) для {operation_label}? "
+        f"(y/N): "
+    )).strip().lower()
+    if ans in ("y", "yes", "д", "да"):
+        return pool
+    print(f"   [..] {operation_label}: иду с main IP (без прокси).")
+    return []
+
+
 async def _run_sweep(accounts: list[dict], sessions: dict, force_relogin: bool) -> None:
     """Запускает sweep по всем аккаунтам последовательно с прогрессом.
 
@@ -3551,13 +3757,14 @@ async def _run_sweep(accounts: list[dict], sessions: dict, force_relogin: bool) 
     )
     print("  Sell-листинги НЕ собираются (как ты просил — это слишком много запросов).")
 
-    # F3: подгружаем прокси-пул (если есть). Распределяем round-robin по аккаунтам.
-    proxy_pool = _load_proxy_pool()
+    # F3: прокси-пул. Спрашиваем у пользователя, использовать ли его (если есть).
+    proxy_pool = await _ask_use_proxy("sweep")
     if proxy_pool:
         print(
-            f"  Proxy: {len(proxy_pool)} прокси в пуле, round-robin по аккаунтам. "
-            f"Только sweep — login/place_sell/cancel пойдут с main IP."
+            f"  Proxy: {len(proxy_pool)} прокси в пуле, round-robin по аккаунтам + "
+            f"failover. Только sweep — login/place_sell/cancel пойдут с main IP."
         )
+    rotator = _ProxyRotator(proxy_pool)
     print()
 
     results: list[dict] = []
@@ -3571,17 +3778,35 @@ async def _run_sweep(accounts: list[dict], sessions: dict, force_relogin: bool) 
         else:
             who = username
         prefix = f"[{idx}/{len(accounts)}] {who[:28]:<28}"
-        # F3: round-robin прокси (если пул не пуст). Стабильный mapping account → proxy
-        # внутри одного запуска sweep'а: idx % pool_size.
-        proxy = proxy_pool[(idx - 1) % len(proxy_pool)] if proxy_pool else None
+        # Берём текущий прокси из ротатора (или None если пул отсутствует/исчерпан).
+        proxy = rotator.current()
         if proxy:
             print(f"{prefix}  логин (proxy {_mask_proxy_for_log(proxy)}) ...", flush=True)
         else:
             print(f"{prefix}  логин ...", flush=True)
+        # Жёсткий per-account timeout — без него медленный/мёртвый прокси может
+        # подвесить ВЕСЬ sweep навечно. На Windows asyncio Ctrl-C не всегда
+        # ловится, поэтому таймаут обязателен. 10 минут на акк — с большим
+        # запасом для нормальной сети.
+        per_acc_timeout_sec = int(os.getenv("SWEEP_ACC_TIMEOUT_SEC", "600"))
         try:
-            res = await _sweep_one_account(
-                account, sessions, force_relogin, fetch_history=True, proxy=proxy,
+            res = await asyncio.wait_for(
+                _sweep_one_account(
+                    account, sessions, force_relogin, fetch_history=True, proxy=proxy,
+                ),
+                timeout=per_acc_timeout_sec,
             )
+        except asyncio.TimeoutError:
+            print(
+                f"{prefix}  [TIMEOUT] акк не уложился в {per_acc_timeout_sec}s "
+                f"(скорее всего тупит {'прокси' if proxy else 'main IP'}). Пропускаю."
+            )
+            res = {
+                "username": username, "label": who,
+                "ok": False, "balance": None, "orders": None,
+                "inventories": {}, "history_added": 0,
+                "errors": [f"TIMEOUT after {per_acc_timeout_sec}s"],
+            }
         except KeyboardInterrupt:
             print("\n[!] Прервано пользователем. Уже собранное в кеше осталось.")
             break
@@ -3604,16 +3829,28 @@ async def _run_sweep(accounts: list[dict], sessions: dict, force_relogin: bool) 
         inv_summary = ", ".join(
             f"{k}={v}" for k, v in res["inventories"].items()
         ) or "—"
+        # Доп. сводка: сколько предметов в display-cooldown'е (hidden от публики).
+        hidden_map = res.get("hidden_from_public") or {}
+        hidden_summary = ""
+        if hidden_map:
+            n_total = sum(hidden_map.values())
+            if n_total > 0:
+                hidden_summary = f"  hidden={n_total}"
         if res["ok"]:
             print(
                 f"{prefix}  OK  bal={bal_str}  orders={res['orders']}  "
-                f"inv: {inv_summary}  history+{res['history_added']}"
+                f"inv: {inv_summary}  history+{res['history_added']}{hidden_summary}"
             )
         else:
             print(
                 f"{prefix}  FAIL  bal={bal_str}  orders={res['orders']}  "
                 f"inv: {inv_summary}  errors: {'; '.join(res['errors'])}"
             )
+        # Failover: если прокси-sweep упал — пометим текущий прокси «плохим».
+        if proxy and not res.get("ok"):
+            rotator.mark_bad()
+        else:
+            rotator.advance()
         # Между аккаунтами небольшая пауза — Steam меньше нервничает.
         await asyncio.sleep(0.5)
 
@@ -3724,43 +3961,56 @@ def _build_label_lookup(accounts: list[dict]) -> dict[str, str]:
     return out
 
 
-async def _show_unbanned_today(
+async def _show_recently_unlocked(
     *,
     accounts: list[dict],
     sessions: dict,
     force_relogin: bool,
     label_lookup: dict[str, str],
 ) -> None:
-    """Показывает предметы, разбанившиеся за последние 24ч (cross-account).
+    """Показывает предметы, недавно разлоченные (cross-account, ≤3 дня).
 
-    Берёт `inventory_cache`, отбирает по `tradable_after ∈ [now-24h, now]`,
-    группирует по имени. На `s <N>` запускает cross-account bulk-list для ВСЕХ
-    свободных экземпляров этого имени (как и просит юзер — задача 7).
+    Источник данных — флаг `hidden_from_public` в `inventory_cache`,
+    проставляется во время sweep'а: diff между нашим (приватным) инвентарём
+    и публичной выдачей Steam. Если предмет у нас есть, а в публичной выдаче
+    его нет — он в display cooldown'е (~3 дня после разлока).
+
+    Бэкап: если по какой-то причине флаг нигде не выставлен (профили закрыты
+    или sweep ещё не делал public-diff), фоллбэчно показываем строки с
+    `tradable_after ∈ [now-3d, now]` — как раньше.
     """
     import cache as _cache
     from datetime import datetime, timezone, timedelta
 
     all_rows = _cache.iter_inventory()
     now = datetime.now(timezone.utc)
-    day_ago = now - timedelta(hours=24)
-    recently: list[dict] = []
-    for r in all_rows:
-        ta_raw = r.get("tradable_after")
-        if not ta_raw:
-            continue
-        try:
-            ta = datetime.fromisoformat(str(ta_raw))
-            if ta.tzinfo is None:
-                ta = ta.replace(tzinfo=timezone.utc)
-        except (ValueError, TypeError):
-            continue
-        if day_ago <= ta <= now:
-            recently.append(r)
+    three_days_ago = now - timedelta(days=3)
+
+    # Основной путь — по флагу hidden_from_public.
+    recently = [r for r in all_rows if r.get("hidden_from_public")]
+    source = "public-diff"
+    if not recently:
+        # Fallback на старую логику по tradable_after, для совместимости с
+        # БД до этой миграции или с акками, у которых профиль закрыт.
+        for r in all_rows:
+            ta_raw = r.get("tradable_after")
+            if not ta_raw:
+                continue
+            try:
+                ta = datetime.fromisoformat(str(ta_raw))
+                if ta.tzinfo is None:
+                    ta = ta.replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                continue
+            if three_days_ago <= ta <= now:
+                recently.append(r)
+        source = "tradable_after-fallback"
 
     if not recently:
         print(
-            "\n   (за последние 24ч ничего не разбанилось — пусто. "
-            "Сделай sweep если ещё не делал в этой сессии.)"
+            "\n   (недавно разлоченных предметов нет — пусто.\n"
+            "    Сделай sweep если ещё не делал в этой сессии — он проставляет\n"
+            "    флаг `hidden_from_public` сравнивая публичный инвентарь с приватным.)"
         )
         await _press_enter_to_continue()
         return
@@ -3784,19 +4034,21 @@ async def _show_unbanned_today(
     def _render(items_slice, start_idx):
         print("\n" + "─" * 92)
         print(
-            f"   Разбанилось за 24ч: {len(grouped)} уник. имён, "
-            f"{len(recently)} предметов (cross-account)"
+            f"   Недавно разлочены (≤3 дня, {source}): "
+            f"{len(grouped)} уник. имён, {len(recently)} предметов (cross-account)"
         )
         print("─" * 92)
-        print(f"   {'#':<4} {'Имя':<50}  {'qty(24h)':<10}  {'аккаунтов':<10}")
+        print(
+            f"   {'#':<4} {'Имя':<50}  {'qty(новые)':<11}  {'аккаунтов':<10}"
+        )
         print("─" * 92)
         for i, (nm, qty, accs_n) in enumerate(items_slice, start_idx):
             short = nm if len(nm) <= 50 else nm[:47] + "..."
-            print(f"   {i:<4} {short:<50}  {qty:<10}  {accs_n:<10}")
+            print(f"   {i:<4} {short:<50}  {qty:<11}  {accs_n:<10}")
         print("─" * 92)
         print(
             "   s <N> — bulk-list по имени (выставить N экз. с разных аккаунтов; "
-            "берёт ВСЕ state=free, не только разбанившиеся)"
+            "берёт ВСЕ state=free, не только недавно разлоченные)"
         )
 
     async def _bulk_action(group_row, idx_1based, _all_groups):
@@ -3937,6 +4189,133 @@ async def _autotrade_loop(
         raise
 
 
+async def _collect_all_listings(
+    accounts: list[dict],
+    sessions: dict,
+    force_relogin: bool,
+) -> None:
+    """Однократный сбор всех sell-листингов по всем акк-ам в `listings_cache`.
+
+    - Идёт последовательно по акк-ам (по тому же порядку что sweep — label_num).
+    - Спрашивает «использовать прокси?» (как обычный sweep).
+    - Внутри каждого акка качает все страницы (count=100) до total.
+    - Между акк-ами рандомная пауза 4-8 сек, чтобы Steam не насторожился.
+    - На сетевую ошибку акка — если прокси, помечаем его как bad и пробуем
+      следующий из ротатора; если main IP — просто переходим к следующему
+      акку, в сводке отмечаем.
+    - Записывает результат через `cache.record_listings(... partial=False)`,
+      то есть стирает старые листинги акка и кладёт свежие.
+    """
+    import cache as _cache
+    import random
+    accounts = _sort_accounts(accounts)
+
+    print("\n" + "=" * 100)
+    print(
+        f"   СБОР ВСЕХ SELL-ЛИСТИНГОВ по {len(accounts)} акк-ам "
+        "(одноразовая операция)."
+    )
+    print("=" * 100)
+    print(
+        "   Каждый акк: get_my_listings страницами по 100, пока не дойдём до total.\n"
+        "   Между акк-ами рандомная пауза 4-8 сек."
+    )
+    proxy_pool = await _ask_use_proxy("сбор листингов")
+    rotator = _ProxyRotator(proxy_pool)
+    if proxy_pool:
+        print(
+            f"   Proxy: {len(proxy_pool)} в пуле, round-robin + failover."
+        )
+
+    total_listings = 0
+    ok_accs = 0
+    fail_accs = 0
+    started_at = datetime.now(timezone.utc)
+
+    for idx, account in enumerate(accounts, 1):
+        username = account["username"]
+        label_n = _label_num(account)
+        who = f"{label_n} ({username})" if label_n is not None else username
+        prefix = f"   [{idx}/{len(accounts)}] {who[:30]:<30}"
+
+        # Используем уже залогиненную сессию из `sessions`, если есть
+        # И прокси не выбран (иначе строим отдельную сессию через _connect_account).
+        proxy = rotator.current()
+        client = None
+        own_session = False
+        if not proxy and username in sessions:
+            client = sessions[username][0]
+        else:
+            # Логин с (опциональным) прокси. Сессию закроем после акка, в `sessions`
+            # её не кладём (если был прокси — менюшным операциям он не нужен).
+            connected = await _connect_account(
+                account, force_relogin, proxy=proxy
+            )
+            if connected is None:
+                print(f"{prefix}  [SKIP] login failed.")
+                if proxy:
+                    rotator.mark_bad()
+                fail_accs += 1
+                continue
+            client = connected[0]
+            own_session = True
+
+        # Качаем все страницы.
+        collected = []
+        try:
+            page_size = 100
+            start = 0
+            total = None
+            while True:
+                # _with_retry на сетевые таймауты
+                active, _to_confirm, _bo, total = await _with_retry(
+                    lambda s=start: client.get_my_listings(start=s, count=page_size),
+                    what=f"get_my_listings (acc={username}, start={start})",
+                )
+                if not active:
+                    break
+                collected.extend(active)
+                start += len(active)
+                if total is not None and start >= total:
+                    break
+                # Мелкая пауза между страницами одного акка.
+                await asyncio.sleep(random.uniform(1.0, 2.0))
+            _cache.record_listings(username, collected, partial=False)
+            print(
+                f"{prefix}  OK  собрано {len(collected)} "
+                f"(total Steam: {total if total is not None else '?'})"
+            )
+            total_listings += len(collected)
+            ok_accs += 1
+            if proxy:
+                rotator.advance()
+        except Exception as exc:  # noqa: BLE001
+            print(f"{prefix}  FAIL  {type(exc).__name__}: {exc}")
+            fail_accs += 1
+            if proxy:
+                rotator.mark_bad()
+        finally:
+            if own_session:
+                try:
+                    await client.session.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        # Пауза между акк-ами (рандомная, чтобы выглядело органично).
+        if idx < len(accounts):
+            pause = random.uniform(4.0, 8.0)
+            await asyncio.sleep(pause)
+
+    duration = (datetime.now(timezone.utc) - started_at).total_seconds()
+    print("\n" + "=" * 100)
+    print(
+        f"   Сбор листингов завершён за {duration:.1f}s. "
+        f"Акк-ов OK: {ok_accs} / FAIL: {fail_accs}. Всего листингов: {total_listings}."
+    )
+    print("=" * 100)
+    await _press_enter_to_continue()
+
+
 async def _start_autotrade(
     accounts: list[dict],
     sessions: dict,
@@ -3999,15 +4378,24 @@ async def _start_autotrade(
         if raw != "1":
             print("   Не понял.")
             continue
-        # Запуск: выбор аккаунтов.
+        # Запуск: выбор аккаунтов. Если у всех акков label — уникальные числа,
+        # пользователь вводит именно эти label'ы (как в главном меню — 22, 53),
+        # а не порядковую нумерацию.
         sorted_accs = _sort_accounts(accounts)
+        label_nums = [_label_num(a) for a in sorted_accs]
+        by_label = (
+            all(n is not None for n in label_nums)
+            and len(set(label_nums)) == len(label_nums)
+        )
         print("\n   Аккаунты:")
         for i, a in enumerate(sorted_accs, 1):
             who = _acc_display(a["username"], label_lookup)
-            print(f"     {i:>3}. {who}")
+            key = str(_label_num(a)) if by_label else str(i)
+            print(f"     {key:>4}. {who}")
         sel_raw = (await _ask(
-            "\n   Введи номера через запятую (`1,3,5`) либо `all` для всех "
-            "(q=отмена): "
+            "\n   Введи "
+            + ("номера акков (как в главном меню) " if by_label else "")
+            + "через запятую (`22,53`) либо `all` для всех (q=отмена): "
         )).strip().lower()
         if sel_raw in ("", "q"):
             print("   Отменено.")
@@ -4027,11 +4415,25 @@ async def _start_autotrade(
                     print(f"   «{part}» — не номер. Отмена.")
                     ok = False
                     break
-                if not (1 <= idx <= len(sorted_accs)):
-                    print(f"   {idx} вне диапазона 1..{len(sorted_accs)}. Отмена.")
-                    ok = False
-                    break
-                usernames.append(sorted_accs[idx - 1]["username"])
+                if by_label:
+                    # Ищем акк по label_num
+                    match = next(
+                        (a for a in sorted_accs if _label_num(a) == idx),
+                        None,
+                    )
+                    if match is None:
+                        print(f"   Акка с label={idx} нет. Отмена.")
+                        ok = False
+                        break
+                    usernames.append(match["username"])
+                else:
+                    if not (1 <= idx <= len(sorted_accs)):
+                        print(
+                            f"   {idx} вне диапазона 1..{len(sorted_accs)}. Отмена."
+                        )
+                        ok = False
+                        break
+                    usernames.append(sorted_accs[idx - 1]["username"])
             if not ok or not usernames:
                 continue
             # дедуп с сохранением порядка
@@ -4179,13 +4581,13 @@ async def _show_global_stats(
             counts[label] = sum(1 for r in _cache.iter_inventory(app_context=ctx_str))
         for i, (label, ctx_str) in enumerate(_GAME_GROUPS, 1):
             print(f"   {i}) {label:<14}— {counts[label]} предметов (в кеше)")
-        print("   u) Tradable с сегодня (cross-account, разбанились за 24ч)")
+        print("   u) Недавно разлочены (≤3 дня, cross-account; diff публичный vs приватный)")
         print("   0) Назад")
         choice = (await _ask("\nВыбор: ")).strip()
         if choice == "0" or choice == "":
             return
         if choice.lower() == "u":
-            await _show_unbanned_today(
+            await _show_recently_unlocked(
                 accounts=accounts or [],
                 sessions=sessions or {},
                 force_relogin=force_relogin,
@@ -4629,6 +5031,11 @@ async def _show_grouped_items(
         if aid_int > max_aid_by_name.get(nm, -1):
             max_aid_by_name[nm] = aid_int
 
+    # Считаем макс. известную цену за штуку для каждого имени:
+    # 1) сначала из активных листингов (listings_cache),
+    # 2) затем добиваем из истории сделок маркета (market_history), чтобы
+    #    `sort price` работал даже когда у нас ничего не на маркете прямо сейчас
+    #    (например, во вьюхе «Свободные» — там has_on_market=False).
     max_price_by_name: dict[str, int] = {}
     if has_on_market:
         for r in rows:
@@ -4644,6 +5051,26 @@ async def _show_grouped_items(
                 continue
             if pc > max_price_by_name.get(nm, -1):
                 max_price_by_name[nm] = pc
+    # market_history даёт реальные цены сделок (по всем аккаунтам), цены могут
+    # быть в разных валютах — для сортировки нам годится «любая прокси-цена»,
+    # так что игнорируем currency_code и берём max(price_cents).
+    try:
+        import cache as _cache_for_price  # лазовый импорт, без top-level
+        for ev in _cache_for_price.iter_all_market_history(limit=10000):
+            nm = ev.get("market_hash_name") or ""
+            pc = ev.get("price_cents")
+            if not nm or pc is None:
+                continue
+            try:
+                pc = int(pc)
+            except (TypeError, ValueError):
+                continue
+            if pc > max_price_by_name.get(nm, -1):
+                max_price_by_name[nm] = pc
+    except Exception as exc:  # noqa: BLE001
+        # На отсутствие истории не падаем — просто `sort price` отсортирует те,
+        # о которых данных нет, в конец (см. ниже).
+        print(f"   [warn] не смог дочитать market_history для sort price: {exc!r}")
 
     def _resort_in_place(items, mode: str) -> None:
         if mode == "qty":
@@ -4664,15 +5091,13 @@ async def _show_grouped_items(
     bulk = {
         "sort qty":   _make_sort_action("qty"),
         "sort new":   _make_sort_action("new"),
+        "sort price": _make_sort_action("price"),
         "sort name":  _make_sort_action("name"),
     }
-    if has_on_market:
-        bulk["sort price"] = _make_sort_action("price")
 
     print(
-        "   Сортировка: `sort qty` (по умолчанию) / `sort new` (по новизне asset_id) "
-        + ("/ `sort price` (макс. цена) " if has_on_market else "")
-        + "/ `sort name`."
+        "   Сортировка: `sort qty` (по умолчанию) / `sort new` (по новизне) "
+        "/ `sort price` (макс. известная цена: листинги + история) / `sort name`."
     )
 
     await _paginate(
@@ -5220,6 +5645,7 @@ async def _pick_account(
     stats_callback=None,
     history_callback=None,
     autotrade_callback=None,
+    collect_listings_callback=None,
 ) -> dict | None:
     """Меню выбора аккаунта.
 
@@ -5231,7 +5657,9 @@ async def _pick_account(
       sweep_callback   — `r` — refresh всех (sweep);
       stats_callback   — `g` — глобальная статистика по инвентарям;
       history_callback — `h` — общая история сделок маркета (cross-account);
-      autotrade_callback — `t` — авто-принятие пустых трейдов (фон).
+      autotrade_callback — `t` — авто-принятие пустых трейдов (фон);
+      collect_listings_callback — `L` — однократный сбор всех sell-листингов
+        по всем акк-ам (опционально через прокси).
     """
     if len(accounts) == 1:
         return accounts[0]
@@ -5241,6 +5669,14 @@ async def _pick_account(
     by_label = all(n is not None for n in label_nums) and len(set(label_nums)) == len(label_nums)
 
     while True:
+        # Множество username'ов под автопринятием прямо сейчас — чтобы поставить [auto].
+        autotrade_running = (
+            _AUTOTRADE_TASK is not None and not _AUTOTRADE_TASK.done()
+        )
+        auto_set: set[str] = (
+            set(_AUTOTRADE_STATE.get("usernames") or [])
+            if autotrade_running else set()
+        )
         print("\n" + "=" * 50)
         print("   Выбери аккаунт")
         print("=" * 50)
@@ -5249,7 +5685,8 @@ async def _pick_account(
             marker = (
                 f" ({acc['label']})" if not by_label and acc["label"] != acc["username"] else ""
             )
-            print(f"  {key}) {acc['username']}{marker}")
+            auto_marker = "  [auto]" if acc["username"] in auto_set else ""
+            print(f"  {key}) {acc['username']}{marker}{auto_marker}")
         print("  s) Сводка по всем аккаунтам (из кеша)")
         if sweep_callback is not None:
             print("  r) Refresh всех (sweep: balance + orders + инвентари + дельта истории)")
@@ -5259,6 +5696,9 @@ async def _pick_account(
             print("  h) История маркета — все аккаунты (cross-account)")
         if autotrade_callback is not None:
             print("  t) Авто-принятие пустых трейдов в фоне")
+        if collect_listings_callback is not None:
+            print("  L) Собрать ВСЕ sell-листинги по всем акк-ам "
+                  "(одноразово, опционально через прокси)")
         print("  0) Выход")
         raw = (await _ask("\nВыбор: ")).strip()
         if raw == "0":
@@ -5292,6 +5732,13 @@ async def _pick_account(
                 await autotrade_callback()
             except Exception as exc:  # noqa: BLE001
                 print(f"[ERROR] autotrade упало: {exc!r}")
+                traceback.print_exc()
+            continue
+        if raw == "L" and collect_listings_callback is not None:
+            try:
+                await collect_listings_callback()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[ERROR] collect listings упало: {exc!r}")
                 traceback.print_exc()
             continue
         try:
@@ -5370,6 +5817,9 @@ async def _run() -> int:
                 ),
                 history_callback=lambda: _show_global_market_history(accounts),
                 autotrade_callback=lambda: _start_autotrade(
+                    accounts, sessions, force_relogin
+                ),
+                collect_listings_callback=lambda: _collect_all_listings(
                     accounts, sessions, force_relogin
                 ),
             )
