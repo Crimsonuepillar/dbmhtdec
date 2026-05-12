@@ -3329,10 +3329,22 @@ async def _fetch_public_inventory_asset_ids(  # noqa: PLR0912, C901
 
                 if not isinstance(data, dict):
                     return (None, "not-json")
+                # Steam различает 'реально приватный' и 'публичный, но всё скрыто':
+                #   - success: false  → профиль/инвентарь приватный
+                #   - assets: null + total_inventory_count > 0 → ВСЁ в display cooldown
+                #     (т.е. публично, но Steam прячет — это именно наш кейс)
+                #   - assets: null + total_inventory_count == 0 → инвентарь пустой
+                if data.get("success") is False:
+                    return (None, "private")
                 assets = data.get("assets")
-                # Профиль публичный, но инвентарь спрятан → 200, assets=None.
                 if assets is None:
-                    return (out if out else None, "private" if not out else None)
+                    # Если ничего ещё не успели насобирать на предыдущих страницах,
+                    # возвращаем ПУСТОЙ set (не None). Это критично: пустой set
+                    # говорит «публично видимых предметов нет», и diff
+                    # priv_ids - public_ids корректно пометит ВСЕ предметы как
+                    # hidden_from_public=1. Если total_inventory_count > 0 — это
+                    # значит акк имеет N предметов, и все они в display cooldown'е.
+                    return (out, None)
                 for a in assets:
                     aid = a.get("assetid") or a.get("asset_id")
                     if aid:
