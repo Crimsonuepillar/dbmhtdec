@@ -3206,16 +3206,21 @@ async def _fetch_public_inventory_asset_ids(
     session,
     steam_id_64: int | str,
     ctx_str: str,
+    *,
+    proxy: str | None = None,
 ) -> set[str] | None:
     """Возвращает set asset_id'ов в публичной выдаче инвентаря пользователя.
 
     Использует `https://steamcommunity.com/inventory/<id>/<appid>/<ctxid>`
     (без авторизации, доступен для публичных профилей). Возвращает None если
-    эндпоинт недоступен / профиль private / в ответе нет ассетов.
+    эндпоинт недоступен / профиль private / в ответе нет ассетов / 4xx.
 
-    Внимание: некоторые акки имеют огромные инвентари — берём первую страницу
-    (count=5000), для CS2 этого хватает почти всегда. Если кто-то хранит десятки
-    тысяч предметов — он явно не в нашей ЦА.
+    Стимовский лимит count=2000 за страницу (всё что выше — 400 Bad Request).
+    Поэтому идём по страницам через `start_assetid` из ответа (`more_items`),
+    но ограничиваем 10 страниц (=20k предметов) — для CS2 этого хватает.
+
+    `proxy`: опционально HTTP/SOCKS прокси. Если задан, запрос пойдёт через
+    него (без него — с main IP сессии).
     """
     import aiohttp
     app_ctx = _PUBLIC_INVENTORY_APP_CONTEXT.get(ctx_str)
@@ -3226,32 +3231,47 @@ async def _fetch_public_inventory_asset_ids(
         f"https://steamcommunity.com/inventory/{steam_id_64}/"
         f"{app_id}/{context_id}"
     )
-    params = {"l": "english", "count": 5000}
-    try:
-        async with session.get(
-            url,
+    out: set[str] = set()
+    start_assetid: str | None = None
+    for _page in range(10):
+        params: dict[str, str | int] = {"l": "english", "count": 2000}
+        if start_assetid:
+            params["start_assetid"] = start_assetid
+        get_kwargs: dict = dict(
+            url=url,
             params=params,
             timeout=aiohttp.ClientTimeout(total=30),
-        ) as resp:
-            if resp.status != 200:
-                return None
-            try:
-                data = await resp.json(content_type=None)
-            except Exception:  # noqa: BLE001
-                return None
-    except Exception:  # noqa: BLE001
-        return None
-    if not isinstance(data, dict):
-        return None
-    assets = data.get("assets")
-    # Если профиль закрыт — Steam отвечает 200 + пустой JSON, тут `assets is None`.
-    if assets is None:
-        return None
-    out: set[str] = set()
-    for a in assets:
-        aid = a.get("assetid") or a.get("asset_id")
-        if aid:
-            out.add(str(aid))
+        )
+        if proxy:
+            get_kwargs["proxy"] = proxy
+        try:
+            async with session.get(**get_kwargs) as resp:
+                if resp.status != 200:
+                    # 400/403/429/5xx — профиль закрыт / лимит / временная ошибка.
+                    return None
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception:  # noqa: BLE001
+                    return None
+        except Exception:  # noqa: BLE001
+            return None
+        if not isinstance(data, dict):
+            return None
+        assets = data.get("assets")
+        # Если профиль закрыт — Steam отвечает 200 + пустой JSON, тут `assets is None`.
+        if assets is None:
+            return None if not out else out  # вернуть то что насобирали
+        for a in assets:
+            aid = a.get("assetid") or a.get("asset_id")
+            if aid:
+                out.add(str(aid))
+        # Steam возвращает `more_items=1` + `last_assetid` если есть ещё.
+        if not data.get("more_items"):
+            break
+        nxt = data.get("last_assetid")
+        if not nxt or str(nxt) == start_assetid:
+            break
+        start_assetid = str(nxt)
     return out
 
 
@@ -3435,7 +3455,7 @@ async def _sweep_one_account(  # noqa: PLR0912, PLR0915, C901
                 sid = getattr(client, "steam_id", None)
                 if sid and ctx_str == "CS2":
                     public_ids = await _fetch_public_inventory_asset_ids(
-                        client.session, sid, ctx_str,
+                        client.session, sid, ctx_str, proxy=proxy,
                     )
                     if public_ids is not None:
                         priv_ids = {
@@ -3633,6 +3653,78 @@ def _load_proxy_pool() -> list[str]:
     return []
 
 
+class _ProxyRotator:
+    """Round-robin прокси с failover'ом.
+
+    Используется одинаково в sweep / csfloat / сборе листингов:
+        rot = _ProxyRotator(pool)
+        for ... in N:
+            for _ in range(max_tries):
+                p = rot.current()
+                ok = await do_thing(proxy=p)
+                if ok: break
+                rot.mark_bad()
+            else:
+                # все прокси не отвечают — выходим
+                break
+            rot.advance()
+
+    Прокси, помеченный как `bad`, временно пропускается. Если все плохие — счётчик
+    сбрасывается (вдруг сеть восстановилась), но больше одного полного круга
+    не делаем.
+    """
+
+    def __init__(self, pool: list[str]) -> None:
+        self._pool = list(pool)
+        self._idx = 0
+        self._bad: set[int] = set()
+
+    @property
+    def size(self) -> int:
+        return len(self._pool)
+
+    def current(self) -> str | None:
+        if not self._pool:
+            return None
+        # ищем первый не-bad начиная с _idx
+        for off in range(len(self._pool)):
+            i = (self._idx + off) % len(self._pool)
+            if i not in self._bad:
+                self._idx = i
+                return self._pool[i]
+        # все bad — сбрасываем чёрный список и повторяем
+        self._bad.clear()
+        return self._pool[self._idx] if self._pool else None
+
+    def mark_bad(self) -> None:
+        if self._pool:
+            self._bad.add(self._idx)
+            self._idx = (self._idx + 1) % len(self._pool)
+
+    def advance(self) -> None:
+        """Просто перейти к следующему (без bad-mark)."""
+        if self._pool:
+            self._idx = (self._idx + 1) % len(self._pool)
+
+
+async def _ask_use_proxy(operation_label: str) -> list[str]:
+    """Если `proxies.txt` загрузился — спрашивает «использовать ли прокси».
+
+    Возвращает list прокси (или [] если пул пуст / отказ). Печатает сводку.
+    """
+    pool = _load_proxy_pool()
+    if not pool:
+        return []
+    ans = (await _ask(
+        f"   Использовать прокси-пул ({len(pool)} шт.) для {operation_label}? "
+        f"(y/N): "
+    )).strip().lower()
+    if ans in ("y", "yes", "д", "да"):
+        return pool
+    print(f"   [..] {operation_label}: иду с main IP (без прокси).")
+    return []
+
+
 async def _run_sweep(accounts: list[dict], sessions: dict, force_relogin: bool) -> None:
     """Запускает sweep по всем аккаунтам последовательно с прогрессом.
 
@@ -3651,13 +3743,14 @@ async def _run_sweep(accounts: list[dict], sessions: dict, force_relogin: bool) 
     )
     print("  Sell-листинги НЕ собираются (как ты просил — это слишком много запросов).")
 
-    # F3: подгружаем прокси-пул (если есть). Распределяем round-robin по аккаунтам.
-    proxy_pool = _load_proxy_pool()
+    # F3: прокси-пул. Спрашиваем у пользователя, использовать ли его (если есть).
+    proxy_pool = await _ask_use_proxy("sweep")
     if proxy_pool:
         print(
-            f"  Proxy: {len(proxy_pool)} прокси в пуле, round-robin по аккаунтам. "
-            f"Только sweep — login/place_sell/cancel пойдут с main IP."
+            f"  Proxy: {len(proxy_pool)} прокси в пуле, round-robin по аккаунтам + "
+            f"failover. Только sweep — login/place_sell/cancel пойдут с main IP."
         )
+    rotator = _ProxyRotator(proxy_pool)
     print()
 
     results: list[dict] = []
@@ -3671,9 +3764,8 @@ async def _run_sweep(accounts: list[dict], sessions: dict, force_relogin: bool) 
         else:
             who = username
         prefix = f"[{idx}/{len(accounts)}] {who[:28]:<28}"
-        # F3: round-robin прокси (если пул не пуст). Стабильный mapping account → proxy
-        # внутри одного запуска sweep'а: idx % pool_size.
-        proxy = proxy_pool[(idx - 1) % len(proxy_pool)] if proxy_pool else None
+        # Берём текущий прокси из ротатора (или None если пул отсутствует/исчерпан).
+        proxy = rotator.current()
         if proxy:
             print(f"{prefix}  логин (proxy {_mask_proxy_for_log(proxy)}) ...", flush=True)
         else:
@@ -3721,6 +3813,11 @@ async def _run_sweep(accounts: list[dict], sessions: dict, force_relogin: bool) 
                 f"{prefix}  FAIL  bal={bal_str}  orders={res['orders']}  "
                 f"inv: {inv_summary}  errors: {'; '.join(res['errors'])}"
             )
+        # Failover: если прокси-sweep упал — пометим текущий прокси «плохим».
+        if proxy and not res.get("ok"):
+            rotator.mark_bad()
+        else:
+            rotator.advance()
         # Между аккаунтами небольшая пауза — Steam меньше нервничает.
         await asyncio.sleep(0.5)
 
@@ -4057,6 +4154,133 @@ async def _autotrade_loop(
     except asyncio.CancelledError:
         print("[autotrade] остановлен пользователем.")
         raise
+
+
+async def _collect_all_listings(
+    accounts: list[dict],
+    sessions: dict,
+    force_relogin: bool,
+) -> None:
+    """Однократный сбор всех sell-листингов по всем акк-ам в `listings_cache`.
+
+    - Идёт последовательно по акк-ам (по тому же порядку что sweep — label_num).
+    - Спрашивает «использовать прокси?» (как обычный sweep).
+    - Внутри каждого акка качает все страницы (count=100) до total.
+    - Между акк-ами рандомная пауза 4-8 сек, чтобы Steam не насторожился.
+    - На сетевую ошибку акка — если прокси, помечаем его как bad и пробуем
+      следующий из ротатора; если main IP — просто переходим к следующему
+      акку, в сводке отмечаем.
+    - Записывает результат через `cache.record_listings(... partial=False)`,
+      то есть стирает старые листинги акка и кладёт свежие.
+    """
+    import cache as _cache
+    import random
+    accounts = _sort_accounts(accounts)
+
+    print("\n" + "=" * 100)
+    print(
+        f"   СБОР ВСЕХ SELL-ЛИСТИНГОВ по {len(accounts)} акк-ам "
+        "(одноразовая операция)."
+    )
+    print("=" * 100)
+    print(
+        "   Каждый акк: get_my_listings страницами по 100, пока не дойдём до total.\n"
+        "   Между акк-ами рандомная пауза 4-8 сек."
+    )
+    proxy_pool = await _ask_use_proxy("сбор листингов")
+    rotator = _ProxyRotator(proxy_pool)
+    if proxy_pool:
+        print(
+            f"   Proxy: {len(proxy_pool)} в пуле, round-robin + failover."
+        )
+
+    total_listings = 0
+    ok_accs = 0
+    fail_accs = 0
+    started_at = datetime.now(timezone.utc)
+
+    for idx, account in enumerate(accounts, 1):
+        username = account["username"]
+        label_n = _label_num(account)
+        who = f"{label_n} ({username})" if label_n is not None else username
+        prefix = f"   [{idx}/{len(accounts)}] {who[:30]:<30}"
+
+        # Используем уже залогиненную сессию из `sessions`, если есть
+        # И прокси не выбран (иначе строим отдельную сессию через _connect_account).
+        proxy = rotator.current()
+        client = None
+        own_session = False
+        if not proxy and username in sessions:
+            client = sessions[username][0]
+        else:
+            # Логин с (опциональным) прокси. Сессию закроем после акка, в `sessions`
+            # её не кладём (если был прокси — менюшным операциям он не нужен).
+            connected = await _connect_account(
+                account, force_relogin, proxy=proxy
+            )
+            if connected is None:
+                print(f"{prefix}  [SKIP] login failed.")
+                if proxy:
+                    rotator.mark_bad()
+                fail_accs += 1
+                continue
+            client = connected[0]
+            own_session = True
+
+        # Качаем все страницы.
+        collected = []
+        try:
+            page_size = 100
+            start = 0
+            total = None
+            while True:
+                # _with_retry на сетевые таймауты
+                active, _to_confirm, _bo, total = await _with_retry(
+                    lambda s=start: client.get_my_listings(start=s, count=page_size),
+                    what=f"get_my_listings (acc={username}, start={start})",
+                )
+                if not active:
+                    break
+                collected.extend(active)
+                start += len(active)
+                if total is not None and start >= total:
+                    break
+                # Мелкая пауза между страницами одного акка.
+                await asyncio.sleep(random.uniform(1.0, 2.0))
+            _cache.record_listings(username, collected, partial=False)
+            print(
+                f"{prefix}  OK  собрано {len(collected)} "
+                f"(total Steam: {total if total is not None else '?'})"
+            )
+            total_listings += len(collected)
+            ok_accs += 1
+            if proxy:
+                rotator.advance()
+        except Exception as exc:  # noqa: BLE001
+            print(f"{prefix}  FAIL  {type(exc).__name__}: {exc}")
+            fail_accs += 1
+            if proxy:
+                rotator.mark_bad()
+        finally:
+            if own_session:
+                try:
+                    await client.session.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        # Пауза между акк-ами (рандомная, чтобы выглядело органично).
+        if idx < len(accounts):
+            pause = random.uniform(4.0, 8.0)
+            await asyncio.sleep(pause)
+
+    duration = (datetime.now(timezone.utc) - started_at).total_seconds()
+    print("\n" + "=" * 100)
+    print(
+        f"   Сбор листингов завершён за {duration:.1f}s. "
+        f"Акк-ов OK: {ok_accs} / FAIL: {fail_accs}. Всего листингов: {total_listings}."
+    )
+    print("=" * 100)
+    await _press_enter_to_continue()
 
 
 async def _start_autotrade(
@@ -5388,6 +5612,7 @@ async def _pick_account(
     stats_callback=None,
     history_callback=None,
     autotrade_callback=None,
+    collect_listings_callback=None,
 ) -> dict | None:
     """Меню выбора аккаунта.
 
@@ -5399,7 +5624,9 @@ async def _pick_account(
       sweep_callback   — `r` — refresh всех (sweep);
       stats_callback   — `g` — глобальная статистика по инвентарям;
       history_callback — `h` — общая история сделок маркета (cross-account);
-      autotrade_callback — `t` — авто-принятие пустых трейдов (фон).
+      autotrade_callback — `t` — авто-принятие пустых трейдов (фон);
+      collect_listings_callback — `L` — однократный сбор всех sell-листингов
+        по всем акк-ам (опционально через прокси).
     """
     if len(accounts) == 1:
         return accounts[0]
@@ -5436,6 +5663,9 @@ async def _pick_account(
             print("  h) История маркета — все аккаунты (cross-account)")
         if autotrade_callback is not None:
             print("  t) Авто-принятие пустых трейдов в фоне")
+        if collect_listings_callback is not None:
+            print("  L) Собрать ВСЕ sell-листинги по всем акк-ам "
+                  "(одноразово, опционально через прокси)")
         print("  0) Выход")
         raw = (await _ask("\nВыбор: ")).strip()
         if raw == "0":
@@ -5469,6 +5699,13 @@ async def _pick_account(
                 await autotrade_callback()
             except Exception as exc:  # noqa: BLE001
                 print(f"[ERROR] autotrade упало: {exc!r}")
+                traceback.print_exc()
+            continue
+        if raw == "L" and collect_listings_callback is not None:
+            try:
+                await collect_listings_callback()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[ERROR] collect listings упало: {exc!r}")
                 traceback.print_exc()
             continue
         try:
@@ -5547,6 +5784,9 @@ async def _run() -> int:
                 ),
                 history_callback=lambda: _show_global_market_history(accounts),
                 autotrade_callback=lambda: _start_autotrade(
+                    accounts, sessions, force_relogin
+                ),
+                collect_listings_callback=lambda: _collect_all_listings(
                     accounts, sessions, force_relogin
                 ),
             )
