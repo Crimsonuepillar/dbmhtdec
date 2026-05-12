@@ -3047,10 +3047,14 @@ async def _connect_account(account: dict, force_relogin: bool, *, proxy: str | N
         print(f"[!] Не смог сразу определить валюту кошелька: {exc!r} (продолжаем).")
 
     # Регистрируем в SQLite-кеше, чтобы аккаунт виден был в меню «Сводка».
+    # steam_id_64 нужен чтобы фетчить публичный инвентарь (см. _show_recently_unlocked).
     try:
         import cache
 
-        cache.record_account(username, account.get("label"))
+        sid = getattr(client, "steam_id", None)
+        cache.record_account(
+            username, account.get("label"), steam_id_64=sid,
+        )
     except Exception:  # noqa: BLE001
         pass
 
@@ -3184,6 +3188,71 @@ async def _show_cache_summary() -> None:
 # `_SECTION_ORDER = ("free", "on_market", "trade_hold", "trade_protect")`.
 # В кеш пишем именно эти значения через state_extractor → `_inventory_state`,
 # который сам учитывает listed_asset_ids + protected_asset_ids.
+
+
+# (AppContext.name → (app_id, context_id)) для публичного эндпоинта инвентаря.
+# Используется в `_fetch_public_inventory_asset_ids` (см. задачу про «недавно
+# разлоченные»: предмет в нашем приватном инвентаре, но не в публичной выдаче
+# = display cooldown ~3 дня после разлока).
+_PUBLIC_INVENTORY_APP_CONTEXT: dict[str, tuple[int, int]] = {
+    "CS2":             (730, 2),
+    "DOTA2":           (570, 2),
+    "STEAM_COMMUNITY": (753, 6),
+    "TF2":             (440, 2),
+}
+
+
+async def _fetch_public_inventory_asset_ids(
+    session,
+    steam_id_64: int | str,
+    ctx_str: str,
+) -> set[str] | None:
+    """Возвращает set asset_id'ов в публичной выдаче инвентаря пользователя.
+
+    Использует `https://steamcommunity.com/inventory/<id>/<appid>/<ctxid>`
+    (без авторизации, доступен для публичных профилей). Возвращает None если
+    эндпоинт недоступен / профиль private / в ответе нет ассетов.
+
+    Внимание: некоторые акки имеют огромные инвентари — берём первую страницу
+    (count=5000), для CS2 этого хватает почти всегда. Если кто-то хранит десятки
+    тысяч предметов — он явно не в нашей ЦА.
+    """
+    import aiohttp
+    app_ctx = _PUBLIC_INVENTORY_APP_CONTEXT.get(ctx_str)
+    if app_ctx is None:
+        return None
+    app_id, context_id = app_ctx
+    url = (
+        f"https://steamcommunity.com/inventory/{steam_id_64}/"
+        f"{app_id}/{context_id}"
+    )
+    params = {"l": "english", "count": 5000}
+    try:
+        async with session.get(
+            url,
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            if resp.status != 200:
+                return None
+            try:
+                data = await resp.json(content_type=None)
+            except Exception:  # noqa: BLE001
+                return None
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(data, dict):
+        return None
+    assets = data.get("assets")
+    # Если профиль закрыт — Steam отвечает 200 + пустой JSON, тут `assets is None`.
+    if assets is None:
+        return None
+    out: set[str] = set()
+    for a in assets:
+        aid = a.get("assetid") or a.get("asset_id")
+        if aid:
+            out.add(str(aid))
+    return out
 
 
 # Список (label_for_user, AppContext, app_context_str_name_for_cache).
@@ -3358,6 +3427,37 @@ async def _sweep_one_account(  # noqa: PLR0912, PLR0915, C901
                 partial=False,
             )
             result["inventories"][label_inv] = len(items)
+            # Параллельно дёргаем публичный инвентарь, чтобы посчитать diff:
+            # asset_id, которых в публичной выдаче нет, но в приватной есть
+            # = display cooldown (~3 дня после разлока, см. задачу 7-2).
+            # Делаем ТОЛЬКО для CS2 — один доп. запрос на акк за весь sweep.
+            try:
+                sid = getattr(client, "steam_id", None)
+                if sid and ctx_str == "CS2":
+                    public_ids = await _fetch_public_inventory_asset_ids(
+                        client.session, sid, ctx_str,
+                    )
+                    if public_ids is not None:
+                        priv_ids = {
+                            str(it.asset_id) for it in items
+                            if str(it.asset_id) not in protected_asset_ids
+                        }
+                        hidden = priv_ids - public_ids
+                        visible = priv_ids & public_ids
+                        n_hid, _n_vis = _cache.update_hidden_from_public(
+                            username, ctx_str, hidden,
+                            visible_asset_ids=visible,
+                        )
+                        result.setdefault("hidden_from_public", {})[label_inv] = n_hid
+                    else:
+                        # Профиль private / эндпоинт недоступен — не падаем.
+                        result["errors"].append(
+                            f"public-inv-{label_inv}: профиль закрыт или 4xx"
+                        )
+            except Exception as exc:  # noqa: BLE001
+                result["errors"].append(
+                    f"public-inv-{label_inv}: {type(exc).__name__}"
+                )
         except Exception as exc:  # noqa: BLE001
             result["errors"].append(f"inv-{label_inv}: {type(exc).__name__}")
 
@@ -3604,10 +3704,17 @@ async def _run_sweep(accounts: list[dict], sessions: dict, force_relogin: bool) 
         inv_summary = ", ".join(
             f"{k}={v}" for k, v in res["inventories"].items()
         ) or "—"
+        # Доп. сводка: сколько предметов в display-cooldown'е (hidden от публики).
+        hidden_map = res.get("hidden_from_public") or {}
+        hidden_summary = ""
+        if hidden_map:
+            n_total = sum(hidden_map.values())
+            if n_total > 0:
+                hidden_summary = f"  hidden={n_total}"
         if res["ok"]:
             print(
                 f"{prefix}  OK  bal={bal_str}  orders={res['orders']}  "
-                f"inv: {inv_summary}  history+{res['history_added']}"
+                f"inv: {inv_summary}  history+{res['history_added']}{hidden_summary}"
             )
         else:
             print(
@@ -3724,43 +3831,56 @@ def _build_label_lookup(accounts: list[dict]) -> dict[str, str]:
     return out
 
 
-async def _show_unbanned_today(
+async def _show_recently_unlocked(
     *,
     accounts: list[dict],
     sessions: dict,
     force_relogin: bool,
     label_lookup: dict[str, str],
 ) -> None:
-    """Показывает предметы, разбанившиеся за последние 24ч (cross-account).
+    """Показывает предметы, недавно разлоченные (cross-account, ≤3 дня).
 
-    Берёт `inventory_cache`, отбирает по `tradable_after ∈ [now-24h, now]`,
-    группирует по имени. На `s <N>` запускает cross-account bulk-list для ВСЕХ
-    свободных экземпляров этого имени (как и просит юзер — задача 7).
+    Источник данных — флаг `hidden_from_public` в `inventory_cache`,
+    проставляется во время sweep'а: diff между нашим (приватным) инвентарём
+    и публичной выдачей Steam. Если предмет у нас есть, а в публичной выдаче
+    его нет — он в display cooldown'е (~3 дня после разлока).
+
+    Бэкап: если по какой-то причине флаг нигде не выставлен (профили закрыты
+    или sweep ещё не делал public-diff), фоллбэчно показываем строки с
+    `tradable_after ∈ [now-3d, now]` — как раньше.
     """
     import cache as _cache
     from datetime import datetime, timezone, timedelta
 
     all_rows = _cache.iter_inventory()
     now = datetime.now(timezone.utc)
-    day_ago = now - timedelta(hours=24)
-    recently: list[dict] = []
-    for r in all_rows:
-        ta_raw = r.get("tradable_after")
-        if not ta_raw:
-            continue
-        try:
-            ta = datetime.fromisoformat(str(ta_raw))
-            if ta.tzinfo is None:
-                ta = ta.replace(tzinfo=timezone.utc)
-        except (ValueError, TypeError):
-            continue
-        if day_ago <= ta <= now:
-            recently.append(r)
+    three_days_ago = now - timedelta(days=3)
+
+    # Основной путь — по флагу hidden_from_public.
+    recently = [r for r in all_rows if r.get("hidden_from_public")]
+    source = "public-diff"
+    if not recently:
+        # Fallback на старую логику по tradable_after, для совместимости с
+        # БД до этой миграции или с акками, у которых профиль закрыт.
+        for r in all_rows:
+            ta_raw = r.get("tradable_after")
+            if not ta_raw:
+                continue
+            try:
+                ta = datetime.fromisoformat(str(ta_raw))
+                if ta.tzinfo is None:
+                    ta = ta.replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                continue
+            if three_days_ago <= ta <= now:
+                recently.append(r)
+        source = "tradable_after-fallback"
 
     if not recently:
         print(
-            "\n   (за последние 24ч ничего не разбанилось — пусто. "
-            "Сделай sweep если ещё не делал в этой сессии.)"
+            "\n   (недавно разлоченных предметов нет — пусто.\n"
+            "    Сделай sweep если ещё не делал в этой сессии — он проставляет\n"
+            "    флаг `hidden_from_public` сравнивая публичный инвентарь с приватным.)"
         )
         await _press_enter_to_continue()
         return
@@ -3784,19 +3904,21 @@ async def _show_unbanned_today(
     def _render(items_slice, start_idx):
         print("\n" + "─" * 92)
         print(
-            f"   Разбанилось за 24ч: {len(grouped)} уник. имён, "
-            f"{len(recently)} предметов (cross-account)"
+            f"   Недавно разлочены (≤3 дня, {source}): "
+            f"{len(grouped)} уник. имён, {len(recently)} предметов (cross-account)"
         )
         print("─" * 92)
-        print(f"   {'#':<4} {'Имя':<50}  {'qty(24h)':<10}  {'аккаунтов':<10}")
+        print(
+            f"   {'#':<4} {'Имя':<50}  {'qty(новые)':<11}  {'аккаунтов':<10}"
+        )
         print("─" * 92)
         for i, (nm, qty, accs_n) in enumerate(items_slice, start_idx):
             short = nm if len(nm) <= 50 else nm[:47] + "..."
-            print(f"   {i:<4} {short:<50}  {qty:<10}  {accs_n:<10}")
+            print(f"   {i:<4} {short:<50}  {qty:<11}  {accs_n:<10}")
         print("─" * 92)
         print(
             "   s <N> — bulk-list по имени (выставить N экз. с разных аккаунтов; "
-            "берёт ВСЕ state=free, не только разбанившиеся)"
+            "берёт ВСЕ state=free, не только недавно разлоченные)"
         )
 
     async def _bulk_action(group_row, idx_1based, _all_groups):
@@ -3999,15 +4121,24 @@ async def _start_autotrade(
         if raw != "1":
             print("   Не понял.")
             continue
-        # Запуск: выбор аккаунтов.
+        # Запуск: выбор аккаунтов. Если у всех акков label — уникальные числа,
+        # пользователь вводит именно эти label'ы (как в главном меню — 22, 53),
+        # а не порядковую нумерацию.
         sorted_accs = _sort_accounts(accounts)
+        label_nums = [_label_num(a) for a in sorted_accs]
+        by_label = (
+            all(n is not None for n in label_nums)
+            and len(set(label_nums)) == len(label_nums)
+        )
         print("\n   Аккаунты:")
         for i, a in enumerate(sorted_accs, 1):
             who = _acc_display(a["username"], label_lookup)
-            print(f"     {i:>3}. {who}")
+            key = str(_label_num(a)) if by_label else str(i)
+            print(f"     {key:>4}. {who}")
         sel_raw = (await _ask(
-            "\n   Введи номера через запятую (`1,3,5`) либо `all` для всех "
-            "(q=отмена): "
+            "\n   Введи "
+            + ("номера акков (как в главном меню) " if by_label else "")
+            + "через запятую (`22,53`) либо `all` для всех (q=отмена): "
         )).strip().lower()
         if sel_raw in ("", "q"):
             print("   Отменено.")
@@ -4027,11 +4158,25 @@ async def _start_autotrade(
                     print(f"   «{part}» — не номер. Отмена.")
                     ok = False
                     break
-                if not (1 <= idx <= len(sorted_accs)):
-                    print(f"   {idx} вне диапазона 1..{len(sorted_accs)}. Отмена.")
-                    ok = False
-                    break
-                usernames.append(sorted_accs[idx - 1]["username"])
+                if by_label:
+                    # Ищем акк по label_num
+                    match = next(
+                        (a for a in sorted_accs if _label_num(a) == idx),
+                        None,
+                    )
+                    if match is None:
+                        print(f"   Акка с label={idx} нет. Отмена.")
+                        ok = False
+                        break
+                    usernames.append(match["username"])
+                else:
+                    if not (1 <= idx <= len(sorted_accs)):
+                        print(
+                            f"   {idx} вне диапазона 1..{len(sorted_accs)}. Отмена."
+                        )
+                        ok = False
+                        break
+                    usernames.append(sorted_accs[idx - 1]["username"])
             if not ok or not usernames:
                 continue
             # дедуп с сохранением порядка
@@ -4179,13 +4324,13 @@ async def _show_global_stats(
             counts[label] = sum(1 for r in _cache.iter_inventory(app_context=ctx_str))
         for i, (label, ctx_str) in enumerate(_GAME_GROUPS, 1):
             print(f"   {i}) {label:<14}— {counts[label]} предметов (в кеше)")
-        print("   u) Tradable с сегодня (cross-account, разбанились за 24ч)")
+        print("   u) Недавно разлочены (≤3 дня, cross-account; diff публичный vs приватный)")
         print("   0) Назад")
         choice = (await _ask("\nВыбор: ")).strip()
         if choice == "0" or choice == "":
             return
         if choice.lower() == "u":
-            await _show_unbanned_today(
+            await _show_recently_unlocked(
                 accounts=accounts or [],
                 sessions=sessions or {},
                 force_relogin=force_relogin,
@@ -4629,6 +4774,11 @@ async def _show_grouped_items(
         if aid_int > max_aid_by_name.get(nm, -1):
             max_aid_by_name[nm] = aid_int
 
+    # Считаем макс. известную цену за штуку для каждого имени:
+    # 1) сначала из активных листингов (listings_cache),
+    # 2) затем добиваем из истории сделок маркета (market_history), чтобы
+    #    `sort price` работал даже когда у нас ничего не на маркете прямо сейчас
+    #    (например, во вьюхе «Свободные» — там has_on_market=False).
     max_price_by_name: dict[str, int] = {}
     if has_on_market:
         for r in rows:
@@ -4644,6 +4794,26 @@ async def _show_grouped_items(
                 continue
             if pc > max_price_by_name.get(nm, -1):
                 max_price_by_name[nm] = pc
+    # market_history даёт реальные цены сделок (по всем аккаунтам), цены могут
+    # быть в разных валютах — для сортировки нам годится «любая прокси-цена»,
+    # так что игнорируем currency_code и берём max(price_cents).
+    try:
+        import cache as _cache_for_price  # лазовый импорт, без top-level
+        for ev in _cache_for_price.iter_all_market_history(limit=10000):
+            nm = ev.get("market_hash_name") or ""
+            pc = ev.get("price_cents")
+            if not nm or pc is None:
+                continue
+            try:
+                pc = int(pc)
+            except (TypeError, ValueError):
+                continue
+            if pc > max_price_by_name.get(nm, -1):
+                max_price_by_name[nm] = pc
+    except Exception as exc:  # noqa: BLE001
+        # На отсутствие истории не падаем — просто `sort price` отсортирует те,
+        # о которых данных нет, в конец (см. ниже).
+        print(f"   [warn] не смог дочитать market_history для sort price: {exc!r}")
 
     def _resort_in_place(items, mode: str) -> None:
         if mode == "qty":
@@ -4664,15 +4834,13 @@ async def _show_grouped_items(
     bulk = {
         "sort qty":   _make_sort_action("qty"),
         "sort new":   _make_sort_action("new"),
+        "sort price": _make_sort_action("price"),
         "sort name":  _make_sort_action("name"),
     }
-    if has_on_market:
-        bulk["sort price"] = _make_sort_action("price")
 
     print(
-        "   Сортировка: `sort qty` (по умолчанию) / `sort new` (по новизне asset_id) "
-        + ("/ `sort price` (макс. цена) " if has_on_market else "")
-        + "/ `sort name`."
+        "   Сортировка: `sort qty` (по умолчанию) / `sort new` (по новизне) "
+        "/ `sort price` (макс. известная цена: листинги + история) / `sort name`."
     )
 
     await _paginate(
@@ -5241,6 +5409,14 @@ async def _pick_account(
     by_label = all(n is not None for n in label_nums) and len(set(label_nums)) == len(label_nums)
 
     while True:
+        # Множество username'ов под автопринятием прямо сейчас — чтобы поставить [auto].
+        autotrade_running = (
+            _AUTOTRADE_TASK is not None and not _AUTOTRADE_TASK.done()
+        )
+        auto_set: set[str] = (
+            set(_AUTOTRADE_STATE.get("usernames") or [])
+            if autotrade_running else set()
+        )
         print("\n" + "=" * 50)
         print("   Выбери аккаунт")
         print("=" * 50)
@@ -5249,7 +5425,8 @@ async def _pick_account(
             marker = (
                 f" ({acc['label']})" if not by_label and acc["label"] != acc["username"] else ""
             )
-            print(f"  {key}) {acc['username']}{marker}")
+            auto_marker = "  [auto]" if acc["username"] in auto_set else ""
+            print(f"  {key}) {acc['username']}{marker}{auto_marker}")
         print("  s) Сводка по всем аккаунтам (из кеша)")
         if sweep_callback is not None:
             print("  r) Refresh всех (sweep: balance + orders + инвентари + дельта истории)")
