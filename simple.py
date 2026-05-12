@@ -373,6 +373,54 @@ async def _with_retry(coro_factory, *, what: str, attempts: int = 3):
     return None  # unreachable
 
 
+async def _cancel_all_pending_confirmations(client, *, label: str = "") -> tuple[int, int]:
+    """Снимает ВСЕ листинги из 'My listings awaiting confirmation' у аккаунта.
+
+    Делается перед bulk-выставлением чтобы:
+      - не накапливать «зависшие» от прошлых попыток,
+      - в случае дубля Steam не вернул confused-ответ.
+
+    Возвращает (n_found, n_cancelled). Если найденных нет — тихо возвращает (0, 0).
+    """
+    try:
+        active, to_confirm, _bo, _total = await _with_retry(
+            lambda: client.get_my_listings(start=0, count=100),
+            what=f"get_my_listings (cleanup-pending {label})",
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"   [!] cleanup-pending {label}: не смог получить листинги: {exc!r}")
+        return (0, 0)
+
+    pending = list(to_confirm or [])
+    if not pending:
+        return (0, 0)
+
+    print(f"   [..] cleanup-pending {label}: найдено {len(pending)} зависших — отменяю ...")
+    cancelled = 0
+    for lst in pending:
+        lid = getattr(lst, "id", None)
+        if lid is None:
+            continue
+        async def _do_cancel(_lid=lid):
+            cm = client.cancel_sell_listing(_lid)
+            async with cm as resp:
+                return resp.status
+        try:
+            status = await _with_retry(
+                _do_cancel, what=f"cancel_sell_listing (cleanup lid={lid})",
+            )
+            if status is None or status < 400:
+                cancelled += 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"       [!] cancel {lid} failed: {exc!r}")
+        await asyncio.sleep(0.3)
+
+    print(f"   [OK] cleanup-pending {label}: отменено {cancelled}/{len(pending)}.")
+    if cancelled > 0:
+        await asyncio.sleep(1.5)  # Дать Steam время вернуть предметы в инвентарь
+    return (len(pending), cancelled)
+
+
 async def _place_sell_listing_with_retry(
     client,
     item_or_asset_id,
@@ -2306,6 +2354,12 @@ async def _bulk_list_group(
     if not await _ask_yes_no(f"   Выставить {len(to_list)} предметов по {gross_str}?"):
         print("   Отменено, возвращаемся в инвентарь.")
         return
+
+    # Перед bulk'ом — чистим awaiting confirmation, чтобы не было дубликатов и
+    # путаницы. Это особенно важно если ранее bulk обрывался на середине.
+    await _cancel_all_pending_confirmations(
+        client, label=f"({client.username}, pre-bulk-list)"
+    )
 
     ok = 0
     fail = 0
@@ -5519,6 +5573,12 @@ async def _bulk_sell_cross_account(  # noqa: PLR0912, PLR0915, C901
                     continue
                 client, _cur, _cf = connected
                 sessions[username] = connected
+
+            # Перед выставлением — чистим awaiting confirmation у ЭТОГО акка,
+            # чтобы не было дубликатов от прошлых обрывов.
+            await _cancel_all_pending_confirmations(
+                client, label=f"({who}, pre-cross-bulk)"
+            )
 
             # Выставляем по одному.
             for i, item_row in enumerate(items_for_user, 1):
