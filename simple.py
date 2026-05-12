@@ -373,6 +373,60 @@ async def _with_retry(coro_factory, *, what: str, attempts: int = 3):
     return None  # unreachable
 
 
+async def _cancel_pending_for_asset(client, asset_id, *, what: str) -> bool:
+    """Если у акк-а в `to_confirm`/`active` болтается листинг с этим asset_id
+    — отменить его (чтобы не получить дубликат при ретрае).
+
+    Возвращает True если что-то отменили (или ничего не было — это норма),
+    False если попытка отмены провалилась.
+    """
+    pending_id = None
+    try:
+        active, to_confirm, _bo, _total = await _with_retry(
+            lambda: client.get_my_listings(start=0, count=100),
+            what=f"get_my_listings ({what} cleanup-lookup)",
+        )
+        for lst in list(to_confirm or []) + list(active or []):
+            try:
+                item = getattr(lst, "item", None)
+                if item is None:
+                    continue
+                if str(getattr(item, "asset_id", None)) == str(asset_id):
+                    pending_id = lst.id
+                    break
+                unowned = getattr(item, "unowned_id", None)
+                if unowned is not None and str(unowned) == str(asset_id):
+                    pending_id = lst.id
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception as e:  # noqa: BLE001
+        print(f"       [!] {what}: не смог получить листинги для cleanup-lookup: {e!r}.")
+        return False
+
+    if pending_id is None:
+        return True  # ничего висящего — норма
+
+    print(f"       [..] {what}: отменяю висящий pending-листинг {pending_id} ...")
+    async def _do_cancel(lid=pending_id):
+        cm = client.cancel_sell_listing(lid)
+        async with cm as resp:
+            return resp.status
+    try:
+        status = await _with_retry(
+            _do_cancel,
+            what=f"cancel_sell_listing ({what}, lid={pending_id})",
+        )
+        if status is not None and status >= 400:
+            print(f"       [!] {what}: cancel_sell_listing вернул HTTP {status}.")
+            return False
+    except Exception as e:  # noqa: BLE001
+        print(f"       [!] {what}: не смог отменить pending {pending_id}: {e!r}.")
+        return False
+    await asyncio.sleep(1.5)
+    return True
+
+
 async def _place_sell_listing_with_retry(
     client,
     item_or_asset_id,
@@ -429,6 +483,12 @@ async def _place_sell_listing_with_retry(
                 )
                 transient_attempt += 1
                 await asyncio.sleep(wait_s)
+                # Перед ретраем — снимаем висящий pending-листинг этого asset_id
+                # из awaiting-confirmation (если Steam успел создать запись до
+                # того как вернул ошибку). Иначе получим дубликат.
+                await _cancel_pending_for_asset(
+                    client, asset_id, what=f"{what} pre-retry",
+                )
                 continue
             final_exc = exc
             break
@@ -450,55 +510,14 @@ async def _place_sell_listing_with_retry(
     )
     await asyncio.sleep(2.5)
 
-    # Find pending listing in to_confirm/active by asset_id.
-    pending_id = None
-    try:
-        active, to_confirm, _bo, _total = await _with_retry(
-            lambda: client.get_my_listings(start=0, count=100),
-            what="get_my_listings (place-retry lookup)",
-        )
-        for lst in list(to_confirm or []) + list(active or []):
-            try:
-                item = getattr(lst, "item", None)
-                if item is None:
-                    continue
-                if str(getattr(item, "asset_id", None)) == str(asset_id):
-                    pending_id = lst.id
-                    break
-                unowned = getattr(item, "unowned_id", None)
-                if unowned is not None and str(unowned) == str(asset_id):
-                    pending_id = lst.id
-                    break
-            except Exception:  # noqa: BLE001
-                pass
-    except Exception as e:  # noqa: BLE001
-        print(f"       [!] Не смог получить листинги для поиска pending: {e!r}.")
+    # Снимаем pending-листинг этого asset_id из awaiting-confirmation, чтобы
+    # не получить дубликат при перевыставлении.
+    ok_cleanup = await _cancel_pending_for_asset(
+        client, asset_id, what=f"{what} confirm-recovery",
+    )
+    if not ok_cleanup:
+        print("       Повторно выставлять не буду — нужно почистить вручную.")
         raise exc
-
-    if pending_id is None:
-        print(
-            "       [..] Pending-листинг не найден (Steam, возможно, не успел "
-            "его записать). Просто повторно выставляю."
-        )
-    else:
-        print(f"       [..] Отменяю pending-листинг {pending_id} ...")
-        async def _do_cancel(lid=pending_id):
-            cm = client.cancel_sell_listing(lid)
-            async with cm as resp:
-                return resp.status
-        try:
-            status = await _with_retry(
-                _do_cancel, what=f"cancel_sell_listing (retry, lid={pending_id})",
-            )
-            if status is not None and status >= 400:
-                raise RuntimeError(f"HTTP {status}")
-        except Exception as e:  # noqa: BLE001
-            print(
-                f"       [!] Не смог отменить pending-листинг {pending_id}: {e!r}.\n"
-                "       Повторно выставлять не буду — нужно почистить вручную."
-            )
-            raise exc
-        await asyncio.sleep(1.5)
 
     # One more attempt.
     try:
